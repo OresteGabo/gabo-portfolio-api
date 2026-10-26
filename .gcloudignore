@@ -1,0 +1,22 @@
+.gcloudignore
+.git
+.gradle
+.kotlin
+.idea
+build
+.env
+.env.*
+private
+.data
+migration-input
+backups
+*.dump
+*.sql.gz
+*.log
+*.key
+*.pem
+.DS_Store
+
+# Neon CLI tooling and local branch context
+node_modules/
+.neon

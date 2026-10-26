@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: gabo_portfolio
+      POSTGRES_USER: gabo
+      POSTGRES_PASSWORD: ${GABO_DATABASE_PASSWORD:?Set GABO_DATABASE_PASSWORD}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - portfolio_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gabo -d gabo_portfolio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  portfolio_data:
