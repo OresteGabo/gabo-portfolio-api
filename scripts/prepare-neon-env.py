@@ -33,14 +33,26 @@ if (pooled.username, pooled.password, pooled.path) != (direct.username, direct.p
 def jdbc(uri):
     return f'jdbc:postgresql://{uri.hostname}:{uri.port or 5432}{uri.path}?' + urlencode({'sslmode': 'verify-full', 'sslfactory': 'org.postgresql.ssl.DefaultJavaSSLFactory'})
 
+# Preserve generated production secrets and origins on later env refreshes.
+previous = {}
+existing = root / '.env.cloudrun'
+if existing.exists():
+    for raw in existing.read_text().splitlines():
+        if raw.strip() and not raw.startswith('#'):
+            key, sep, value = raw.partition('=')
+            if sep:
+                previous[key] = ' '.join(shlex.split(value, comments=True))
 result = {k: v for k, v in values.items() if k.startswith('BONDS_') or k in ('CRON_SECRET',)}
+for key in ('CRON_SECRET', 'BONDS_MARKET_SNAPSHOT_SECRET'):
+    if not result.get(key) and previous.get(key):
+        result[key] = previous[key]
 result.update({
     'SPRING_PROFILES_ACTIVE': 'cloudrun',
     'GABO_DATABASE_URL': jdbc(pooled),
     'GABO_MIGRATION_DATABASE_URL': jdbc(direct),
     'GABO_DATABASE_USER': unquote(pooled.username),
     'GABO_DATABASE_PASSWORD': unquote(pooled.password),
-    'GABO_ALLOWED_ORIGINS': 'https://bonds.orestegabo.dev',
+    'GABO_ALLOWED_ORIGINS': previous.get('GABO_ALLOWED_ORIGINS', 'https://bonds.orestegabo.dev'),
 })
 target = root / '.env.cloudrun'
 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
