@@ -19,7 +19,7 @@ After migration: two invited accounts, five bonds across all accounts (three own
 ## Verification
 
 - Spring Gradle build: 19 tests, zero failures.
-- Android shared/core tests and debug APK: successful.
+- Android shared/core tests: 143 passed (128 shared + 15 core), zero failures; debug APK successful.
 - iPhone device build: successful.
 - Production HTTPS verification through both the Cloud Run origin and public website: owner session, purchases, shares, overview, all five PDF hashes/downloads, synthetic invited-account login, data isolation, pending confirmation, PDF upload and account deletion. Synthetic accounts and sessions removed afterward.
 - Temporary authenticated transfer deployment deleted after cutover.
@@ -27,7 +27,7 @@ After migration: two invited accounts, five bonds across all accounts (three own
 
 ## Future updates
 
-Build and publish a new linux/amd64 container to the Portfolio Artifact Registry, then update only this Cloud Run service, preserving secrets, origins and scaling limits. Run `./gradlew build` before publishing. The API source currently has no Git remote; configure its own repository before setting up CI. Do not put `.env*`, local backups or PDFs in Git or the image.
+Build and publish a new linux/amd64 container to the Portfolio Artifact Registry, then update only this Cloud Run service, preserving secrets, origins and scaling limits. Run `./gradlew build` before publishing. API source repository: https://github.com/OresteGabo/gabo-portfolio-api. Deployment currently uses an explicit local build and push; GitHub pushes do not automatically deploy the API. Do not put `.env*`, local backups or PDFs in Git or the image.
 
 Keep `BONDS_API_ORIGIN` in Vercel Production. The website's legacy database settings remain for rollback, but normal `/api/bonds/*` traffic is handled by Spring. Do not write independently to the old database after cutover. The original website deployment and database are retained as rollback references; a rollback after new writes requires reconciling those writes.
 

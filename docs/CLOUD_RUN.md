@@ -1,6 +1,6 @@
 # Cloud Run deployment
 
-Target project: `gabo-portfolio-api`. Always pass `--project=gabo-portfolio-api` to gcloud commands; do not change or replace Kaze resources. This document prepares a deployment, not an automatic production cutover.
+Target project: `gabo-portfolio-api`. Always pass `--project=gabo-portfolio-api` to gcloud commands; do not change or replace Kaze resources. The production deployment is complete; see DEPLOYMENT_STATUS.md for verified addresses, migration details and future update instructions.
 
 ## Database first
 
