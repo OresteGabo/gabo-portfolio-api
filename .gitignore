@@ -57,3 +57,6 @@ node_modules/
 # Neon CLI tooling and local branch context
 node_modules/
 .neon
+
+# Short-lived Google credentials created by GitHub Actions
+gha-creds-*.json

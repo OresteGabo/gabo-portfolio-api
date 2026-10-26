@@ -1,0 +1,125 @@
+name: Test and deploy API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Build and run PostgreSQL integration tests
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon build
+
+  deploy:
+    name: Deploy production
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: portfolio-api-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: gabo-portfolio-api
+      REGION: europe-west1
+      SERVICE: gabo-portfolio-api
+      IMAGE: europe-west1-docker.pkg.dev/gabo-portfolio-api/portfolio/api:${{ github.sha }}
+      CANDIDATE_TAG: ci-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build container from the tested commit
+        run: docker build --platform linux/amd64 --tag "$IMAGE" .
+      - name: Authenticate to Google Cloud without a key
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Publish container
+        run: |
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+          docker push "$IMAGE"
+          echo "DEPLOY_IMAGE=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')" >> "$GITHUB_ENV"
+      - name: Deploy candidate without changing production traffic
+        id: candidate
+        run: |
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > previous-service.json
+          gcloud run services update "$SERVICE" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --image="$DEPLOY_IMAGE" \
+            --revision-suffix="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --update-labels="git-sha=$GITHUB_SHA" \
+            --no-traffic --tag="$CANDIDATE_TAG" --quiet
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > candidate-service.json
+          python3 - <<'PY'
+          import json, os
+          previous = json.load(open('previous-service.json'))['status']['traffic']
+          current = json.load(open('candidate-service.json'))['status']['traffic']
+          candidate = next(t for t in current if t.get('tag') == os.environ['CANDIDATE_TAG'])
+          traffic = ','.join(f"{t['revisionName']}={t['percent']}" for t in previous if t.get('percent', 0) > 0)
+          assert traffic and candidate.get('url') and candidate.get('revisionName')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"revision={candidate['revisionName']}\n")
+              out.write(f"url={candidate['url']}\n")
+              out.write(f"previous_traffic={traffic}\n")
+          PY
+      - name: Check candidate database and API health
+        env:
+          CANDIDATE_URL: ${{ steps.candidate.outputs.url }}
+        run: |
+          curl --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 60 "$CANDIDATE_URL/actuator/health" > health.json
+          python3 -c 'import json; assert json.load(open("health.json"))["status"] == "UP"'
+      - name: Switch production to the healthy revision
+        id: promote
+        env:
+          REVISION: ${{ steps.candidate.outputs.revision }}
+        run: |
+          gcloud run services update-traffic "$SERVICE" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --to-revisions="$REVISION=100" --remove-tags="$CANDIDATE_TAG" --quiet
+      - name: Verify public API after promotion
+        run: |
+          curl --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 60 \
+            'https://gabo-portfolio-api-639858675564.europe-west1.run.app/actuator/health' > health.json
+          python3 -c 'import json; assert json.load(open("health.json"))["status"] == "UP"'
+      - name: Restore previous traffic if promotion or public verification fails
+        if: failure() && (steps.promote.outcome == 'success' || steps.promote.outcome == 'failure')
+        env:
+          PREVIOUS_TRAFFIC: ${{ steps.candidate.outputs.previous_traffic }}
+        run: |
+          gcloud run services update-traffic "$SERVICE" --project="$PROJECT_ID" --region="$REGION" \
+            --to-revisions="$PREVIOUS_TRAFFIC" --quiet
+      - name: Remove the temporary candidate tag after a failed rollout
+        if: always() && steps.candidate.outcome == 'success' && steps.promote.outcome != 'success'
+        run: |
+          gcloud run services update-traffic "$SERVICE" --project="$PROJECT_ID" --region="$REGION" \
+            --remove-tags="$CANDIDATE_TAG" --quiet

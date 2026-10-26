@@ -27,7 +27,7 @@ After migration: two invited accounts, five bonds across all accounts (three own
 
 ## Future updates
 
-Build and publish a new linux/amd64 container to the Portfolio Artifact Registry, then update only this Cloud Run service, preserving secrets, origins and scaling limits. Run `./gradlew build` before publishing. API source repository: https://github.com/OresteGabo/gabo-portfolio-api. Deployment currently uses an explicit local build and push; GitHub pushes do not automatically deploy the API. Do not put `.env*`, local backups or PDFs in Git or the image.
+Build and publish a new linux/amd64 container to the Portfolio Artifact Registry, then update only this Cloud Run service, preserving secrets, origins and scaling limits. Run `./gradlew build` before publishing. API source repository: https://github.com/OresteGabo/gabo-portfolio-api. Pushes to `main` build, test and deploy through GitHub Actions; see CI_CD.md for identity restrictions and rollout checks. Do not put `.env*`, local backups or PDFs in Git or the image.
 
 Keep `BONDS_API_ORIGIN` in Vercel Production. The website's legacy database settings remain for rollback, but normal `/api/bonds/*` traffic is handled by Spring. Do not write independently to the old database after cutover. The original website deployment and database are retained as rollback references; a rollback after new writes requires reconciling those writes.
 
