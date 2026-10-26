@@ -23,6 +23,7 @@ class GaboPortfolioApiApplicationTests {
     @Autowired lateinit var db: JdbcTemplate
     @Autowired lateinit var json: JsonCodec
     @Autowired lateinit var auth: AuthService
+    @Autowired lateinit var notifications: PriceNotifications
     @Autowired lateinit var history: MarketHistory
     @Autowired lateinit var importer: WebSeedImporter
     private val http=HttpClient.newHttpClient()
@@ -39,7 +40,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // This datasource is supplied exclusively by the isolated Testcontainers PostgreSQL bean.
-        db.execute("TRUNCATE bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE price_push_deliveries,push_devices,price_notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
         val builder=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds$path"))
@@ -185,6 +186,36 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(1,history.history(listOf("IMR"),"all").records("observations").size)
         assertEquals(401,call("/rse/daily").statusCode());assertEquals(401,call("/rse/snapshot").statusCode())
     }
+    @Test fun `price changes alert only eligible holders once and unread data is isolated`() {
+        val owner=login();val (uid,other)=user()
+        assertEquals(201,call("/equities","POST",equity(),owner).statusCode())
+        assertEquals(201,call("/equities","POST",equity(),other).statusCode())
+        fun close(day: String,price: Int)=history.record(mapOf("source" to mapOf("status" to "available","stale" to false,
+            "publishedAt" to "${day}T12:00:00Z","checkedAt" to "${day}T13:00:00Z"),"quotes" to listOf(mapOf("ticker" to "IMR","closing" to price))))
+        close("2026-10-21",110);assertEquals(0,notifications.collect("2026-10-21"))
+        close("2026-10-22",110);assertEquals(0,notifications.collect("2026-10-22"))
+        close("2026-10-23",115);assertEquals(2,notifications.collect("2026-10-23"));assertEquals(0,notifications.collect("2026-10-23"))
+        val data=data(call("/notifications",cookie=owner));assertEquals(1,data["unreadCount"])
+        val alert=data.records("notifications").single();assertEquals("IMR",alert["ticker"])
+        assertEquals(5000.0,alert.number("impact"));assertEquals(23900.0,alert.number("totalGain"),.01)
+        assertEquals(200,call("/notifications/read","POST",mapOf("ids" to listOf(alert["id"])),other).statusCode())
+        assertEquals(1,data(call("/notifications",cookie=owner))["unreadCount"])
+        assertEquals(200,call("/notifications/read","POST",mapOf("ids" to listOf(alert["id"])),owner).statusCode())
+        assertEquals(0,data(call("/notifications",cookie=owner))["unreadCount"])
+        val device=newId();val token="synthetic-push-token-for-test"
+        val payload=mapOf("deviceId" to device,"platform" to "android","token" to token,"language" to "en","environment" to "production")
+        assertEquals(200,call("/notifications/devices","POST",payload,owner).statusCode())
+        notifications.collect("2026-10-23")
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM price_push_deliveries",Int::class.java))
+        assertEquals(200,call("/notifications/devices","POST",payload,other).statusCode())
+        assertEquals(uid,db.queryForObject("SELECT owner_id FROM push_devices WHERE id=?::uuid",String::class.java,device))
+        assertEquals(200,call("/auth/logout","POST",mapOf("deviceId" to device),other).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM push_devices",Int::class.java))
+        close("2026-10-26",90);assertEquals(2,notifications.collect("2026-10-26"))
+        assertTrue(data(call("/notifications",cookie=owner)).records("notifications").first().number("impact")<0)
+        assertEquals(401,call("/notifications").statusCode())
+    }
+
     @Test fun `invalid dates and raw internal errors never leak into API responses`() {
         val cookie=login()
         val invalid=call("/purchases","POST",bond()+mapOf("purchaseDate" to "2026-02-30"),cookie)

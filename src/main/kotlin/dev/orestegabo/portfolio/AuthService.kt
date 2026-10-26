@@ -119,7 +119,7 @@ class AuthService(
         // Serialize against imports and mutations for this account before deleting all its data.
         lockAccount(db, id)
         if (db.queryForList("SELECT id FROM bond_users WHERE id=? AND email=? FOR UPDATE", id, email).isEmpty()) return false
-        for (table in listOf("bond_purchases", "equity_purchases", "bond_statement_items", "bond_uploaded_documents", "bond_document_uploads")) db.update("DELETE FROM $table WHERE owner_id=?", id)
+        for (table in listOf("push_devices", "price_notifications", "bond_purchases", "equity_purchases", "bond_statement_items", "bond_uploaded_documents", "bond_document_uploads")) db.update("DELETE FROM $table WHERE owner_id=?", id)
         db.update("DELETE FROM bond_sessions WHERE user_id=?", id)
         db.update("DELETE FROM bond_registration WHERE email=?", email)
         db.update("DELETE FROM bond_users WHERE id=? AND email=?", id, email)

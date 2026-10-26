@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*
 
 @RestController
 @RequestMapping("/api/bonds/auth")
-class AuthController(private val auth: AuthService, private val portfolios: PortfolioService) {
+class AuthController(private val auth: AuthService, private val portfolios: PortfolioService,private val notifications: PriceNotifications) {
     @GetMapping("/session") fun session(request: HttpServletRequest): Record {
         val account = auth.session(request)
         return mapOf("authenticated" to (account != null), "user" to account?.publicInfo())
@@ -20,7 +20,9 @@ class AuthController(private val auth: AuthService, private val portfolios: Port
         auth.start(account, request, response)
         return mapOf("authenticated" to true, "user" to account.publicInfo())
     }
-    @PostMapping("/logout") fun logout(request: HttpServletRequest, response: HttpServletResponse): Record {
+    @PostMapping("/logout") fun logout(request: HttpServletRequest, response: HttpServletResponse, @RequestBody(required=false) body: Record?): Record {
+        val device=body?.text("deviceId").orEmpty()
+        if(device.isNotBlank())notifications.unregister(currentAccount().id,device)
         auth.revoke(request); auth.clear(response)
         return mapOf("authenticated" to false)
     }
