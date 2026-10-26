@@ -42,10 +42,10 @@ class PricePushSender(private val db: JdbcTemplate,private val json: JsonCodec,
     fun deliver() {
         val started=System.nanoTime()
         val rows=db.queryForList("""SELECT q.notification_id::text,q.device_id::text,d.platform,d.token,d.environment,d.language,n.ticker
-            FROM price_push_deliveries q JOIN price_notifications n ON n.id=q.notification_id
+            FROM price_push_deliveries q JOIN notifications n ON n.id=q.notification_id
             JOIN push_devices d ON d.id=q.device_id AND d.owner_id=n.owner_id
             WHERE q.sent_at IS NULL AND q.attempts<5 AND q.next_attempt_at<=now() AND n.read_at IS NULL
-                AND NOT EXISTS(SELECT 1 FROM bond_users u WHERE u.id=n.owner_id AND u.disabled_at IS NOT NULL) AND n.created_at>=now()-interval '3 days' ORDER BY n.created_at LIMIT 20""")
+                AND NOT EXISTS(SELECT 1 FROM bond_users u WHERE u.id=n.owner_id AND u.disabled_at IS NOT NULL) AND COALESCE((SELECT (categories->>n.kind)::boolean FROM notification_preferences WHERE owner_id=n.owner_id),true) AND n.created_at>=now()-interval '3 days' ORDER BY n.created_at LIMIT 20""")
         for(row in rows) {
             if((System.nanoTime()-started)>45_000_000_000L)break
             val platform=row.text("platform")
@@ -55,8 +55,8 @@ class PricePushSender(private val db: JdbcTemplate,private val json: JsonCodec,
             try {
                 // No balance, price, holding quantity or account identity on the lock screen.
                 val french=row.text("language")=="fr"
-                val title=if(french)"Cours des actions" else "Share price update"
-                val body=if(french)"Un nouveau cours RSE est disponible. Ouvrez l’application pour voir les détails." else "A new RSE price is available. Open the app to see the details."
+                val title=if(french)"Gabo Portfolio" else "Gabo Portfolio"
+                val body=if(french)"Une nouvelle notification est disponible dans l’application." else "You have a new notification. Open the app for details."
                 var invalid=false
                 val success=if(platform=="android") {
                     try {

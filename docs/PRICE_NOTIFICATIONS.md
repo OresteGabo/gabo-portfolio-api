@@ -1,12 +1,26 @@
-# Price notifications
+# Notifications
 
 The Stocks navigation item shows the server unread count. Its app-bar bell opens a paginated inbox. Opening an alert expands its detail and marks that alert read only after the server acknowledges it. Financial text uses the existing number-hiding and capture-redaction components. English and French share the same implementation.
 
 Spring creates alerts after the scheduled RSE collection, for active RWF/RSE holdings owned by each account on the market date. The comparison uses the preceding recorded close, which may be earlier than yesterday. The first observation and unchanged prices create no alerts. Repeated collections create no additional alert for the same account/company/market date. Holdings and cash cost are captured at that time, so later purchases do not rewrite historical impact. Results are estimates, not realised profit or sale proceeds.
 
+## Notification categories and coupon receipts
+
+Settings > Notifications > Notification preferences controls share prices, coupons, maturities, subscription windows, pending purchases, missing documents, monthly targets, report exports and native-device sign-ins. Preferences and the monthly target are stored by Spring per account and synchronized between devices.
+
+- Coupon reminders start within three days of the due date; a due reminder remains actionable for thirty days. Confirm received records a manual receipt. Mark not received reverses it and prevents automatic marking from overriding that decision.
+- Auto-confirm coupons is off by default. Turning it on establishes a start date in Rwanda time. Only coupons due from that date onward are marked automatically, including catch-up after a missed run. Earlier schedules are not retroactively treated as receipts. Automatic marks are explicitly labelled and reversible; they are not bank verification.
+- Bond maturity reminders start thirty days ahead. Subscription reminders use the published opening/closing window, with a separate closing reminder in its final two days. Keep the API's issuance-calendar.json updated when new official calendars are published; no future windows are invented.
+- Pending purchases are reminded after at least three days and once settlement is due. Their action opens the confirmation file picker directly. Missing-document reminders use statement reconciliation and resolve when matching purchases are saved.
+- A monthly target milestone counts confirmed contributions, excluding pending purchases and market-price gains. It is emitted once per month.
+- A report notice is created only after the user successfully saves the locally generated PDF. The report itself is not hosted by this endpoint. Coupon receipts, including manual/automatic status, are included in the PDF and its structured archive.
+- New-device alerts identify a new native app installation after an earlier installation is known. They do not infer location or fingerprint a browser. The initial known installation establishes a baseline without an alert.
+
+The existing daily cron processes calendar/account reminders even if RSE fetching fails. Opening the inbox also synchronizes reminders. Event keys prevent duplicates; the upcoming and due coupon reminders are distinct stages. Scheduled coupon totals continue to be labelled scheduled; confirmed receipts are shown separately.
+
 ## Activate after committing
 
-Nothing is deployed by this change. Push the API commit first; its existing deployment pipeline applies V5 automatically. Then build/install the mobile app. Older APIs do not have the notification endpoints; the inbox explains this without blocking the portfolio.
+Nothing is deployed by this change. Push the API commit first; its existing deployment pipeline applies V5 and V6 automatically. Then build/install the mobile app. Older APIs do not have the notification endpoints; the inbox explains this without blocking the portfolio.
 
 In-app notifications work on both platforms without push-provider credentials. Push permissions are requested only from the inbox/settings action. Denying them leaves in-app notifications usable.
 

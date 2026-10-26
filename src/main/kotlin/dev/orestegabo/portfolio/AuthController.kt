@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*
 
 @RestController
 @RequestMapping("/api/bonds/auth")
-class AuthController(private val auth: AuthService, private val portfolios: PortfolioService,private val notifications: PriceNotifications) {
+class AuthController(private val auth: AuthService, private val portfolios: PortfolioService,private val notifications: PriceNotifications,private val lifecycle: LifecycleNotifications) {
     @GetMapping("/session") fun session(request: HttpServletRequest): Record {
         val account = auth.session(request)
         return mapOf("authenticated" to (account != null), "user" to account?.publicInfo())
@@ -18,6 +18,7 @@ class AuthController(private val auth: AuthService, private val portfolios: Port
         checkApi(email != null && body["password"] is String && body.text("password").length <= 128, "Invalid email or password.", 401)
         val account = auth.authenticate(email!!, body.text("password")) ?: throw ApiError(401, "Invalid email or password.")
         auth.start(account, request, response)
+        runCatching { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform")) }
         return mapOf("authenticated" to true, "user" to account.publicInfo())
     }
     @PostMapping("/logout") fun logout(request: HttpServletRequest, response: HttpServletResponse, @RequestBody(required=false) body: Record?): Record {
@@ -34,6 +35,7 @@ class AuthController(private val auth: AuthService, private val portfolios: Port
         checkApi(Regex("[A-Za-z0-9_-]{43}").matches(body.text("invite")), "This invitation is invalid or expired.", 403)
         val account = auth.register(email!!, body.text("password"), body.text("invite"))
         auth.start(account, request, response)
+        runCatching { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform")) }
         return mapOf("authenticated" to true, "user" to account.publicInfo())
     }
     @GetMapping("/registration") fun registration(): Record {

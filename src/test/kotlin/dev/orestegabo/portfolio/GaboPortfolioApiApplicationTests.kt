@@ -23,6 +23,7 @@ class GaboPortfolioApiApplicationTests {
     @Autowired lateinit var db: JdbcTemplate
     @Autowired lateinit var json: JsonCodec
     @Autowired lateinit var auth: AuthService
+    @Autowired lateinit var lifecycle: LifecycleNotifications
     @Autowired lateinit var notifications: PriceNotifications
     @Autowired lateinit var history: MarketHistory
     @Autowired lateinit var importer: WebSeedImporter
@@ -40,7 +41,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // This datasource is supplied exclusively by the isolated Testcontainers PostgreSQL bean.
-        db.execute("TRUNCATE price_push_deliveries,push_devices,price_notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
         val builder=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds$path"))
@@ -157,8 +158,15 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(200,result.statusCode(),result.body());assertEquals("missing",data(result).records("rows").single()["state"])
         assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
         assertEquals(1,data(call("/statement-items",cookie=cookie)).records("items").size)
-        call("/purchases","POST",bond("active"),cookie)
+        lifecycle.sync("owner",notificationToday())
+        assertEquals(1,notifications.list("owner",null).records("notifications").count { it["kind"]=="documents" })
+        val saved=data(call("/purchases","POST",bond("active"),cookie))["purchase"].record()
         assertTrue(data(call("/statement-items",cookie=cookie)).records("items").isEmpty())
+        lifecycle.sync("owner",notificationToday())
+        assertEquals(true,notifications.list("owner",null).records("notifications").first { it["kind"]=="documents" }["resolved"])
+        call("/purchases/${saved.text("id")}","DELETE",cookie=cookie)
+        lifecycle.sync("owner",notificationToday())
+        assertFalse(notifications.list("owner",null).records("notifications").first { it["kind"]=="documents" }["resolved"]==true)
     }
     @Test fun `invitations are single use and self deletion removes private data and revokes every session`() {
         val owner=login()
@@ -206,7 +214,7 @@ class GaboPortfolioApiApplicationTests {
         val payload=mapOf("deviceId" to device,"platform" to "android","token" to token,"language" to "en","environment" to "production")
         assertEquals(200,call("/notifications/devices","POST",payload,owner).statusCode())
         notifications.collect("2026-10-23")
-        assertEquals(1,db.queryForObject("SELECT count(*) FROM price_push_deliveries",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM price_push_deliveries",Int::class.java)) // Already-read alerts are not pushed.
         assertEquals(200,call("/notifications/devices","POST",payload,other).statusCode())
         assertEquals(uid,db.queryForObject("SELECT owner_id FROM push_devices WHERE id=?::uuid",String::class.java,device))
         assertEquals(200,call("/auth/logout","POST",mapOf("deviceId" to device),other).statusCode())
@@ -214,6 +222,59 @@ class GaboPortfolioApiApplicationTests {
         close("2026-10-26",90);assertEquals(2,notifications.collect("2026-10-26"))
         assertTrue(data(call("/notifications",cookie=owner)).records("notifications").first().number("impact")<0)
         assertEquals(401,call("/notifications").statusCode())
+    }
+
+    @Test fun `coupon confirmation is private idempotent reversible and automatic mode starts today`() {
+        val cookie=login();val (_,other)=user();val today=notificationToday()
+        val dates=listOf(today.minusDays(1),today,today.plusDays(1)).map { it.toString() }
+        val saved=data(call("/purchases","POST",bond("active")+mapOf("couponDates" to dates,"firstCouponDate" to dates.first(),"scheduleConfidence" to "confirmed"),cookie))["purchase"].record()
+        val id=saved.text("id");assertTrue(uuid(id))
+        assertEquals(false,lifecycle.preferences("owner")["autoCoupon"])
+        lifecycle.sync("owner",today)
+        assertTrue(lifecycle.receipts("owner").isEmpty())
+        lifecycle.receive("owner",id,today.toString(),true,today);lifecycle.receive("owner",id,today.toString(),true,today)
+        assertEquals(1,lifecycle.receipts("owner").size)
+        val bad=call("/notifications/coupons","POST",mapOf("purchaseId" to id,"dueDate" to today.toString(),"received" to true),other)
+        assertEquals(404,bad.statusCode())
+        assertThrows(ApiError::class.java) { lifecycle.receive("owner",id,today.plusDays(1).toString(),true,today) }
+        lifecycle.receive("owner",id,today.toString(),false,today)
+        lifecycle.update("owner",mapOf("autoCoupon" to true));lifecycle.sync("owner",today)
+        assertFalse(lifecycle.receipts("owner").single()["received"] as Boolean) // Manual undo wins over automatic marking.
+        lifecycle.sync("owner",today.plusDays(1));lifecycle.sync("owner",today.plusDays(1))
+        val receipts=lifecycle.receipts("owner");assertEquals(2,receipts.size)
+        assertFalse(receipts.any { it["dueDate"]==today.minusDays(1).toString() })
+        assertEquals("automatic",receipts.first { it["dueDate"]==today.plusDays(1).toString() }["method"])
+        val categories=notificationCategories.associateWith { it!="coupons" }
+        lifecycle.update("owner",mapOf("categories" to categories))
+        assertTrue(notifications.list("owner",null).records("notifications").none { it["kind"]=="coupons" })
+    }
+    @Test fun `general reminders reports targets and new devices are deduplicated`() {
+        val cookie=login();val today=notificationToday()
+        assertEquals(201,call("/purchases","POST",bond(),cookie).statusCode())
+        lifecycle.update("owner",mapOf("monthlyTarget" to 100))
+        assertEquals(201,call("/equities","POST",equity()+mapOf("tradeDate" to today.toString(),"settlementDate" to today.toString()),cookie).statusCode())
+        lifecycle.sync("owner",today);lifecycle.sync("owner",today)
+        val items=notifications.list("owner",null).records("notifications")
+        assertEquals(1,items.count { it["kind"]=="targets" })
+        assertEquals(1,items.count { it["kind"]=="pending" })
+        val first=newId();val second=newId()
+        lifecycle.signIn("owner",first,"ios");lifecycle.signIn("owner",second,"android");lifecycle.signIn("owner",second,"android")
+        val report=mapOf("exportId" to "a".repeat(32),"date" to today.toString())
+        lifecycle.report("owner",report);lifecycle.report("owner",report)
+        val all=notifications.list("owner",null).records("notifications")
+        assertEquals(1,all.count { it["kind"]=="security" });assertEquals(1,all.count { it["kind"]=="reports" })
+        assertTrue(notifications.list(user().first,null).records("notifications").none { it["kind"] in listOf("security","reports","targets") })
+    }
+
+    @Test fun `subscription closing and maturity reminders use real dates and do not repeat`() {
+        val cookie=login()
+        val saved=data(call("/purchases","POST",bond("active")+mapOf("maturityDate" to "2026-11-15"),cookie))
+        assertTrue(uuid(saved["purchase"].record().text("id")))
+        val day=java.time.LocalDate.parse("2026-10-20")
+        lifecycle.sync("owner",day);lifecycle.sync("owner",day)
+        val items=notifications.list("owner",null).records("notifications")
+        assertEquals(1,items.count { it["kind"]=="subscriptions" && it["stage"]=="closing" })
+        assertEquals(1,items.count { it["kind"]=="maturities" && it["dueDate"]=="2026-11-15" })
     }
 
     @Test fun `invalid dates and raw internal errors never leak into API responses`() {

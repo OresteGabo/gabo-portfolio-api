@@ -8,7 +8,7 @@ import java.time.Instant
 
 @RestController
 @RequestMapping("/api/bonds/rse")
-class MarketController(private val market: MarketService,private val history: MarketHistory,private val notifications: PriceNotifications,private val pushes: PricePushSender,
+class MarketController(private val market: MarketService,private val history: MarketHistory,private val notifications: PriceNotifications,private val pushes: PricePushSender,private val lifecycle: LifecycleNotifications,
     @Value("\${gabo.cron-secret:}") private val cronSecret: String,
     @Value("\${gabo.snapshot-secret:}") private val snapshotSecret: String) {
     @GetMapping("/quotes") fun quotes(@RequestParam kind: String,@RequestParam(required=false) refresh: String?): Record {
@@ -38,6 +38,8 @@ class MarketController(private val market: MarketService,private val history: Ma
             }
             saved
         }.getOrDefault(mapOf("status" to "collection-failed"))
+        runCatching { lifecycle.daily() }
+        runCatching { pushes.deliver() }
         runCatching { history.run(start,result.text("status"),result.text("marketDate").ifBlank { null }) }
         return ResponseEntity.status(if(result["status"]=="saved")200 else 503).body(result)
     }
