@@ -24,9 +24,10 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
         val issuance=if(m.text("category")=="Bond issuance") BondIssuance.validate(m["issuance"].record()) else null
         val metadata=m.filterKeys { it in listOf("label","instrumentName","issuer","category","documentDate") }+mapOf("description" to "","originalFileName" to if(m.text("category")=="Bond confirmation") "bond-confirmation.pdf" else if(issuance!=null) "bond-issuance.pdf" else "share-contract.pdf") + (issuance?.let { mapOf("issuance" to it,"issuanceKey" to BondIssuance.key(it),"details" to BondIssuance.details(it)) } ?: emptyMap())
         db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND created_at<now()-interval '1 day'",owner)
-        val existing=db.queryForList("SELECT parts,part_count,metadata FROM bond_document_uploads WHERE owner_id=? AND upload_id=? FOR UPDATE",owner,p["uploadId"]).firstOrNull()
+        // JSONB compares equivalent numeric forms (e.g. 1E10 and 10000000000) across upload parts.
+        val existing=db.queryForList("SELECT parts,part_count,metadata=?::jsonb AS same_metadata FROM bond_document_uploads WHERE owner_id=? AND upload_id=? FOR UPDATE",json.write(metadata),owner,p["uploadId"]).firstOrNull()
         val parts=if(existing==null) linkedMapOf<String,Any?>() else json.read(existing["parts"].toString()).toMutableMap()
-        if(existing!=null) checkApi((existing["part_count"] as Number).toInt()==count.toInt() && json.read(existing["metadata"].toString())==metadata,"This upload could not be resumed.",409)
+        if(existing!=null) checkApi((existing["part_count"] as Number).toInt()==count.toInt() && existing["same_metadata"]==true,"This upload could not be resumed.",409)
         else checkApi((db.queryForObject("SELECT count(*) FROM bond_document_uploads WHERE owner_id=?",Long::class.java,owner) ?: 0)<8,"Too many unfinished uploads. Please try again later.",429)
         val key=index.toInt().toString()
         checkApi(parts[key]==null || parts[key]==p["content"],"This upload chunk conflicts with an earlier selection.",409)

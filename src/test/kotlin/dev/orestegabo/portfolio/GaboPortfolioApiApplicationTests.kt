@@ -334,6 +334,39 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(409,call("/purchases/${conflict.text("id")}/confirm","POST",proof,owner).statusCode())
     }
 
+    @Test fun `two part public report saves its PDF and enriches all accounts only after completion`() {
+        val owner=login();val (_,other)=user()
+        val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
+        val pending=bond()+mapOf("bondName" to "October 20-year bond","isin" to "","tenorYears" to 20,"maturityDate" to issue["maturityDate"],"couponRate" to 0,"firstCouponDate" to "","couponDates" to emptyList<String>())
+        val a=data(call("/purchases","POST",pending,owner))["purchase"].record()
+        val b=data(call("/purchases","POST",pending,other))["purchase"].record()
+        // Match the supplied public report's size; optionally exercise the original bytes locally.
+        val bytes=System.getenv("GABO_TEST_ISSUANCE_PDF")?.let { java.nio.file.Files.readAllBytes(java.nio.file.Path.of(it)) }
+            ?: ByteArray(538039) { 32 }.also { "%PDF-1.7\n".toByteArray().copyInto(it);"\n%%EOF".toByteArray().copyInto(it,it.size-6) }
+        assertTrue(bytes.size>512*1024 && bytes.size<=1024*1024)
+        val metadata=mapOf("label" to "Bond issuance results","category" to "Bond issuance","documentDate" to issue["issuanceDate"],"instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"issuance" to issue)
+        fun part(index: Int,uploadId: String="b".repeat(32),cookie: String=owner,details: Record=metadata)=call("/documents","POST",mapOf("uploadId" to uploadId,"index" to index,"count" to 2,
+            "content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(index*512*1024,minOf(bytes.size,(index+1)*512*1024))),"metadata" to details),cookie)
+        val first=part(0);assertEquals(200,first.statusCode(),first.body());assertFalse(data(first).containsKey("documentId"))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        assertEquals(409,part(1,details=metadata+mapOf("label" to "Changed during upload")).statusCode())
+        val complete=part(1);assertEquals(200,complete.statusCode(),complete.body());assertEquals(2,data(complete)["updatedPendingPurchases"])
+        for((purchase,cookie) in listOf(a to owner,b to other)) {
+            val saved=data(call("/purchases/${purchase.text("id")}",cookie=cookie))["purchase"].record()
+            assertEquals("submitted",saved["status"]);assertEquals(.1315,saved.number("couponRate"));assertEquals(40,saved.strings("couponDates").size)
+            assertEquals(purchase.number("faceValue"),saved.number("faceValue"));assertEquals(11000.0,saved.number("feesPaid"))
+            val document=data(call("/documents",cookie=cookie)).records("documents").single()
+            assertEquals(data(complete)["documentId"],document["id"])
+        }
+        val download=http.send(HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds/documents/${data(complete).text("documentId")}"))
+            .header("Cookie",other).GET().build(),HttpResponse.BodyHandlers.ofByteArray())
+        assertEquals(200,download.statusCode());assertArrayEquals(bytes,download.body())
+        assertEquals(200,part(0,"c".repeat(32),other).statusCode())
+        val duplicate=part(1,"c".repeat(32),other);assertEquals(200,duplicate.statusCode(),duplicate.body());assertEquals(true,data(duplicate)["duplicate"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+    }
+
     @Test fun `issuance uploads are shared idempotent and guarded against conflicting terms`() {
         val cookie=login()
         val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
