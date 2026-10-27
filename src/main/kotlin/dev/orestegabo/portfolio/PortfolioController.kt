@@ -19,6 +19,7 @@ class PortfolioController(private val portfolio: PortfolioService,private val do
     @PostMapping("/purchases") @ResponseStatus(HttpStatus.CREATED)
     fun createBond(@RequestBody body: Record)=mapOf("purchase" to portfolio.saveBond(currentAccount().id,body))
     @PutMapping("/purchases/{id}") fun updateBond(@PathVariable id: String,@RequestBody body: Record)=mapOf("purchase" to portfolio.saveBond(currentAccount().id,body,id))
+    @PostMapping("/purchases/{id}/confirm") fun confirmBond(@PathVariable id: String,@RequestBody body: Record)=mapOf("purchase" to portfolio.confirmPending(currentAccount().id,id,body))
     @DeleteMapping("/purchases/{id}") fun deleteBond(@PathVariable id: String): Record {
         checkApi(portfolio.deleteBond(currentAccount().id,id),"Purchase not found.",404)
         return mapOf("deleted" to true)
