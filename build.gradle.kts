@@ -20,7 +20,13 @@ repositories {
     mavenCentral()
 }
 
+// Keep the managed OpenTelemetry family aligned while fixing GHSA-ccrj-gw8r-854m.
+extra["opentelemetry.version"] = "1.67.0"
+
 dependencies {
+    constraints {
+        implementation("com.google.guava:guava:33.7.2-jre") { because("GHSA-xxph-c9ww-hj94") }
+    }
     implementation("com.google.firebase:firebase-admin:9.11.0")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
@@ -30,8 +36,8 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-webmvc")
     implementation("org.flywaydb:flyway-database-postgresql")
     implementation("org.jetbrains.kotlin:kotlin-reflect")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
-    implementation("org.jsoup:jsoup:1.21.2")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.85.2")
+    implementation("org.jsoup:jsoup:1.23.2")
     implementation("tools.jackson.module:jackson-module-kotlin")
     developmentOnly("org.springframework.boot:spring-boot-devtools")
     runtimeOnly("org.postgresql:postgresql")
