@@ -21,6 +21,8 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
         checkApi(bytes.isNotEmpty() && bytes.size<=512*1024 && Base64.getEncoder().encodeToString(bytes)==p.text("content") && (index==count-1 || bytes.size==512*1024) && (index!=0.0 || bytes.take(5).toByteArray().contentEquals("%PDF-".toByteArray())),error)
         val m=p["metadata"].record()
         checkApi(m.text("category") in listOf("Bond confirmation","Share contract","Bond issuance","Statement") && date(m.text("documentDate"))!=null && listOf("label","instrumentName","issuer").all { m[it] is String && m.text(it).length<=240 },error)
+        // Shared canonical terms update other accounts and must not trust an arbitrary authenticated uploader.
+        if(m.text("category")=="Bond issuance") checkApi(owner=="owner","Only the owner can publish shared issuance results.",403)
         val issuance=if(m.text("category")=="Bond issuance") BondIssuance.validate(m["issuance"].record()) else null
         val metadata=m.filterKeys { it in listOf("label","instrumentName","issuer","category","documentDate") }+mapOf("description" to "","originalFileName" to if(m.text("category")=="Bond confirmation") "bond-confirmation.pdf" else if(issuance!=null) "bond-issuance.pdf" else if(m.text("category")=="Statement") "broker-statement.pdf" else "share-contract.pdf") + (issuance?.let { mapOf("issuance" to it,"issuanceKey" to BondIssuance.key(it),"details" to BondIssuance.details(it)) } ?: emptyMap())
         db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND created_at<now()-interval '1 day'",owner)
@@ -35,10 +37,10 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
         db.update("INSERT INTO bond_document_uploads(owner_id,upload_id,part_count,parts,metadata) VALUES (?,?,?,?::jsonb,?::jsonb) ON CONFLICT(owner_id,upload_id) DO UPDATE SET parts=EXCLUDED.parts",owner,p["uploadId"],count.toInt(),json.write(parts),json.write(metadata))
         if(parts.size!=count.toInt()) return emptyMap()
         val complete=(0 until count.toInt()).map { Base64.getDecoder().decode(parts[it.toString()].toString()) }.fold(java.io.ByteArrayOutputStream()) { out,part->out.apply { write(part) } }.toByteArray()
-        checkApi(complete.size<=10*1024*1024 && complete.take(5).toByteArray().contentEquals("%PDF-".toByteArray()),error)
+        validateUploadedPdfEnvelope(complete)
         val hash=java.security.MessageDigest.getInstance("SHA-256").digest(complete).joinToString("") { "%02x".format(it) }
         if(issuance!=null) {
-            // Global unique identity resolves simultaneous uploads from different accounts.
+            // Global unique identity resolves concurrent approved publication.
             // A conflicting report never overwrites the canonical terms or source PDF.
             val saved=db.queryForList("INSERT INTO bond_issuance_documents(issue_key,sha256,content,metadata) VALUES (?,?,?,?::jsonb) ON CONFLICT(issue_key) DO UPDATE SET issue_key=EXCLUDED.issue_key RETURNING id::text,metadata,(xmax<>0) AS duplicate",BondIssuance.key(issuance),hash,Base64.getEncoder().encodeToString(complete),json.write(metadata)).single()
             val prior=BondIssuance.validate(json.read(saved["metadata"].toString())["issuance"].record())

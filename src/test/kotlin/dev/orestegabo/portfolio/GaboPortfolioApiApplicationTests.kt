@@ -67,7 +67,7 @@ class GaboPortfolioApiApplicationTests {
     }
     private fun bond(status: String="submitted"): Record=mapOf("instrumentType" to "treasury","issuer" to "Government of Rwanda","currency" to "RWF","market" to "primary","purchaseDate" to "2026-10-01","settlementDate" to "2026-10-23","bondName" to "SYNTHETIC/2026/5YR","isin" to "RWTEST123456","tenorYears" to 5,"faceValue" to 1200000,"pricePercent" to 100,"accruedInterestPaid" to 0,"feesPaid" to 11000,"couponRate" to .12,"maturityDate" to "2031-10-23","couponFrequency" to 2,"scheduleConfidence" to "estimated","status" to status)
     private fun equity(): Record=mapOf("instrumentType" to "equity","exchange" to "RSE","currency" to "RWF","securityName" to "Synthetic I&M","ticker" to "IMR","isin" to "RWTEST123456","tradeDate" to "2026-09-24","settlementDate" to "2026-09-28","shares" to 1000,"pricePerShare" to 90,"grossConsideration" to 90000,"brokerageCommission" to 1000,"rseTransactionFee" to 50,"csdTransactionLevy" to 25,"cmaTransactionFee" to 25,"totalCharges" to 1100,"netAmountPayable" to 91100,"broker" to "BK Capital","contractNote" to "20260004454#01")
-    private fun upload(cookie: String,bytes: ByteArray="%PDF-1.7\nsynthetic fixture".toByteArray(),uploadId: String="a".repeat(32),index: Int=0,count: Int=1): HttpResponse<String> = call("/documents","POST",mapOf("uploadId" to uploadId,"index" to index,"count" to count,"content" to Base64.getEncoder().encodeToString(bytes),"metadata" to mapOf("category" to "Bond confirmation","documentDate" to "2026-10-23","label" to "Synthetic result","instrumentName" to "SYNTHETIC/2026/5YR","issuer" to "BNR")),cookie)
+    private fun upload(cookie: String,bytes: ByteArray="%PDF-1.7\nsynthetic fixture\n%%EOF".toByteArray(),uploadId: String="a".repeat(32),index: Int=0,count: Int=1): HttpResponse<String> = call("/documents","POST",mapOf("uploadId" to uploadId,"index" to index,"count" to count,"content" to Base64.getEncoder().encodeToString(bytes),"metadata" to mapOf("category" to "Bond confirmation","documentDate" to "2026-10-23","label" to "Synthetic result","instrumentName" to "SYNTHETIC/2026/5YR","issuer" to "BNR")),cookie)
 
     @Test fun `sessions are opaque revocable and invalidated by credential changes`() {
         assertEquals(false,data(call("/auth/session"))["authenticated"])
@@ -125,7 +125,7 @@ class GaboPortfolioApiApplicationTests {
     @Test fun `PDF chunks are private ordered idempotent bounded and retryable`() {
         val cookie=login()
         val first=ByteArray(512*1024) { 32 }.also { "%PDF-1.7".toByteArray().copyInto(it) }
-        val tail="last bytes".toByteArray();val id="b".repeat(32)
+        val tail="last bytes\n%%EOF".toByteArray();val id="b".repeat(32)
         assertEquals(emptyMap<String,Any>(),data(upload(cookie,tail,id,1,2)))
         assertTrue(data(call("/documents",cookie=cookie)).records("documents").isEmpty())
         val result=upload(cookie,first,id,0,2);assertEquals(200,result.statusCode(),result.body())
@@ -171,6 +171,29 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(setOf("ticker","date","price","low","high","source"),own.keys)
         assertEquals(400,call("/rse/equity-history?tickers=IMR&period=invalid").statusCode())
         assertEquals(400,call("/rse/equity-history?tickers=bad").statusCode())
+    }
+
+    @Test fun `only the owner can publish shared issuance and change other accounts pending terms`() {
+        val owner=login();val (_,other)=user()
+        val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
+        val pending=bond()+mapOf("isin" to "","tenorYears" to 20,"maturityDate" to issue["maturityDate"],"couponRate" to 0,"firstCouponDate" to "","couponDates" to emptyList<String>())
+        val purchase=data(call("/purchases","POST",pending,owner))["purchase"].record()
+        val result=call("/documents","POST",mapOf("uploadId" to "e".repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic untrusted publication\n%%EOF".toByteArray()),
+            "metadata" to mapOf("category" to "Bond issuance","label" to "Untrusted publication","instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"documentDate" to issue["issuanceDate"],"issuance" to issue)),other)
+        assertEquals(403,result.statusCode(),result.body())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+        assertEquals(0.0,data(call("/purchases/${purchase.text("id")}",cookie=owner))["purchase"].record().number("couponRate"))
+    }
+
+    @Test fun `incomplete PDF uploads never create a visible document or retained single chunk`() {
+        val cookie=login()
+        val result=upload(cookie,"%PDF-1.7\ntruncated evidence".toByteArray())
+        assertEquals(400,result.statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+        assertFalse(result.body().contains("truncated evidence"))
     }
 
     @Test fun `statement PDFs use the existing private duplicate safe document workflow`() {
@@ -361,7 +384,7 @@ class GaboPortfolioApiApplicationTests {
         val a=data(call("/purchases","POST",pending,owner))["purchase"].record()
         val b=data(call("/purchases","POST",pending+mapOf("faceValue" to 2000000),other))["purchase"].record()
         val wrong=data(call("/purchases","POST",pending+mapOf("isin" to "RW000WRONGCODE","faceValue" to 3000000),owner))["purchase"].record()
-        val bytes=Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public report".toByteArray())
+        val bytes=Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public report\n%%EOF".toByteArray())
         val uploaded=call("/documents","POST",mapOf("uploadId" to "e".repeat(32),"count" to 1,"index" to 0,"content" to bytes,"metadata" to mapOf("label" to "Bond issuance results","category" to "Bond issuance","documentDate" to issue["issuanceDate"],"instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"issuance" to issue)),owner)
         assertEquals(200,uploaded.statusCode(),uploaded.body());assertEquals(2,data(uploaded)["updatedPendingPurchases"])
         fun purchase(id: String,cookie: String)=data(call("/purchases/$id",cookie=cookie))["purchase"].record()
@@ -376,7 +399,7 @@ class GaboPortfolioApiApplicationTests {
         assertEquals("active",purchase(a.text("id"),owner)["status"]);assertEquals("",purchase(a.text("id"),owner)["notes"]);assertEquals("submitted",purchase(b.text("id"),other)["status"])
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
         assertEquals(200,call("/purchases/${a.text("id")}/confirm","POST",proof,owner).statusCode())
-        val personal=data(call("/documents","POST",mapOf("uploadId" to "f".repeat(32),"count" to 1,"index" to 0,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic personal confirmation".toByteArray()),"metadata" to mapOf("label" to "Bond confirmation","category" to "Bond confirmation","documentDate" to "2026-10-23","instrumentName" to issue["bondName"],"issuer" to issue["issuer"])),owner)).text("documentId")
+        val personal=data(call("/documents","POST",mapOf("uploadId" to "f".repeat(32),"count" to 1,"index" to 0,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic personal confirmation\n%%EOF".toByteArray()),"metadata" to mapOf("label" to "Bond confirmation","category" to "Bond confirmation","documentDate" to "2026-10-23","instrumentName" to issue["bondName"],"issuer" to issue["issuer"])),owner)).text("documentId")
         val attached=call("/purchases/${a.text("id")}","PUT",purchase(a.text("id"),owner)+mapOf("confirmationDocumentId" to personal),owner)
         assertEquals(200,attached.statusCode(),attached.body());assertEquals("document",data(attached)["purchase"].record()["confirmationMethod"])
         assertEquals(personal,purchase(a.text("id"),owner)["confirmationDocumentId"])
@@ -415,8 +438,8 @@ class GaboPortfolioApiApplicationTests {
         val download=http.send(HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds/documents/${data(complete).text("documentId")}"))
             .header("Cookie",other).GET().build(),HttpResponse.BodyHandlers.ofByteArray())
         assertEquals(200,download.statusCode());assertArrayEquals(bytes,download.body())
-        assertEquals(200,part(0,"c".repeat(32),other).statusCode())
-        val duplicate=part(1,"c".repeat(32),other);assertEquals(200,duplicate.statusCode(),duplicate.body());assertEquals(true,data(duplicate)["duplicate"])
+        assertEquals(200,part(0,"c".repeat(32),owner).statusCode())
+        val duplicate=part(1,"c".repeat(32),owner);assertEquals(200,duplicate.statusCode(),duplicate.body());assertEquals(true,data(duplicate)["duplicate"])
         assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
     }
@@ -426,10 +449,10 @@ class GaboPortfolioApiApplicationTests {
         val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
         fun send(id: Char, terms: Record=issue, token: String=cookie)=call("/documents","POST",mapOf(
             "uploadId" to id.toString().repeat(32),"count" to 1,"index" to 0,
-            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic $id".toByteArray()),
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic $id\n%%EOF".toByteArray()),
             "metadata" to mapOf("category" to "Bond issuance","label" to "Bond issuance results","instrumentName" to issue["bondName"],"issuer" to "Government of Rwanda","documentDate" to "2026-10-21","issuance" to terms)),token)
-        // Different bytes and concurrent sessions still leave a single canonical report.
-        val (_,concurrentUser)=user()
+        // Different bytes and concurrent owner sessions still leave a single canonical report.
+        val concurrentUser=login()
         val gate=java.util.concurrent.CountDownLatch(1)
         val first=java.util.concurrent.CompletableFuture.supplyAsync { gate.await();send('a') }
         val second=java.util.concurrent.CompletableFuture.supplyAsync { gate.await();send('b',token=concurrentUser) }
@@ -450,9 +473,7 @@ class GaboPortfolioApiApplicationTests {
         val (_,other)=user()
         assertEquals(2,data(call("/documents",cookie=other)).records("documents").size)
         val otherUpload=send('e',token=other)
-        assertEquals(200,otherUpload.statusCode(),otherUpload.body())
-        assertEquals(data(a)["documentId"],data(otherUpload)["documentId"])
-        assertEquals(true,data(otherUpload)["duplicate"])
+        assertEquals(403,otherUpload.statusCode(),otherUpload.body())
         assertEquals(200,call("/documents/${data(a)["documentId"]}",cookie=other).statusCode())
         assertEquals(401,call("/documents/${data(a)["documentId"]}").statusCode())
         assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
@@ -512,7 +533,7 @@ class GaboPortfolioApiApplicationTests {
 
     @Test fun `equity imports preserve their private contract PDF and reject another account source`() {
         val (_,a)=user();val (_,b)=user()
-        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic share contract".toByteArray()),
+        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic share contract\n%%EOF".toByteArray()),
             "metadata" to mapOf("category" to "Share contract","documentDate" to "2026-09-24","label" to "Synthetic share contract","instrumentName" to "Synthetic security","issuer" to "BK Capital")),a)
         assertEquals(200,source.statusCode(),source.body())
         val id=data(source).text("documentId")
@@ -527,7 +548,7 @@ class GaboPortfolioApiApplicationTests {
         val (owner,cookie)=user()
         val item=mapOf("kind" to "bond","date" to "2026-10-26","amount" to 1200000,"title" to "Bond Cost","currency" to "RWF","broker" to "BK Capital")
         val legacy=data(call("/statement-items","POST",mapOf("items" to listOf(item)),cookie)).records("rows").single().text("id")
-        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic legacy statement".toByteArray()),
+        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic legacy statement\n%%EOF".toByteArray()),
             "metadata" to mapOf("category" to "Statement","documentDate" to "2026-10-31","label" to "Statement","instrumentName" to "Investment statement","issuer" to "BK Capital")),cookie)
         val id=data(source).text("documentId")
         repeat(2) {
