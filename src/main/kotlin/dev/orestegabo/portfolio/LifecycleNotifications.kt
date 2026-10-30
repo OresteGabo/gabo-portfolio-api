@@ -47,8 +47,10 @@ class LifecycleNotifications(private val db: JdbcTemplate,
                              private val json: JsonCodec,
                              private val portfolio: PortfolioService,
                              private val statements: StatementService,
-                             private val notifications: PriceNotifications)
+                             private val notifications: PriceNotifications,
+                             transactionManager: org.springframework.transaction.PlatformTransactionManager)
 {
+    private val dailyTransactions=org.springframework.transaction.support.TransactionTemplate(transactionManager)
     private val calendar=javaClass.getResourceAsStream("/issuance-calendar.json")!!.bufferedReader().use { json.list(it.readText()) }
     fun preferences(owner: String): Record {
         val row=db.queryForList("SELECT categories,auto_coupon,monthly_target FROM notification_preferences WHERE owner_id=?",owner).firstOrNull()
@@ -131,7 +133,8 @@ class LifecycleNotifications(private val db: JdbcTemplate,
     }
     fun daily(today: LocalDate=notificationToday()) {
         val owners=db.queryForList("SELECT 'owner' AS id UNION SELECT id FROM bond_users WHERE disabled_at IS NULL UNION SELECT owner_id AS id FROM notification_preferences").map { it.text("id") }
-        for(owner in owners) runCatching { sync(owner,today) }
+        // Self-invocation bypasses @Transactional; give each account an actual rollback/lock boundary.
+        for(owner in owners) runCatching { dailyTransactions.executeWithoutResult { sync(owner,today) } }
     }
     @Transactional fun signIn(owner: String,device: String,platform: String) {
         if(!uuid(device) || platform !in listOf("ios","android"))return

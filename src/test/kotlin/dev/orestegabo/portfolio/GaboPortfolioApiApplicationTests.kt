@@ -187,6 +187,24 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(0.0,data(call("/purchases/${purchase.text("id")}",cookie=owner))["purchase"].record().number("couponRate"))
     }
 
+    @Test fun `daily lifecycle sync rolls back coupon acknowledgements when notification work fails`() {
+        val cookie=login();val day=java.time.LocalDate.parse("2026-10-23")
+        assertEquals(201,call("/purchases","POST",bond("active")+mapOf("couponDates" to listOf(day.toString()),"firstCouponDate" to day.toString(),"scheduleConfidence" to "confirmed"),cookie).statusCode())
+        lifecycle.update("owner",mapOf("autoCoupon" to true))
+        db.update("UPDATE notification_preferences SET auto_coupon_from=?::date WHERE owner_id='owner'",day.minusDays(1).toString())
+        db.execute("CREATE FUNCTION struct_test_notification_failure() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''synthetic failure''; END'")
+        db.execute("CREATE TRIGGER struct_test_notification_failure BEFORE INSERT ON notifications FOR EACH ROW EXECUTE FUNCTION struct_test_notification_failure()")
+        try {
+            lifecycle.daily(day)
+            assertEquals(0,db.queryForObject("SELECT count(*) FROM coupon_receipts",Int::class.java))
+        } finally {
+            db.execute("DROP TRIGGER struct_test_notification_failure ON notifications")
+            db.execute("DROP FUNCTION struct_test_notification_failure()")
+        }
+        lifecycle.daily(day);lifecycle.daily(day)
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM coupon_receipts",Int::class.java))
+    }
+
     @Test fun `incomplete PDF uploads never create a visible document or retained single chunk`() {
         val cookie=login()
         val result=upload(cookie,"%PDF-1.7\ntruncated evidence".toByteArray())
