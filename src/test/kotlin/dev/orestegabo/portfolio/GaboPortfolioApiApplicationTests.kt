@@ -40,8 +40,8 @@ class GaboPortfolioApiApplicationTests {
         }
     }
     @BeforeEach fun clean() {
-        // This datasource is supplied exclusively by the isolated Testcontainers PostgreSQL bean.
-        db.execute("TRUNCATE account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
+        db.execute("TRUNCATE bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
         val builder=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds$path"))
@@ -151,6 +151,34 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(400,call("/rse/equity-history?tickers=IMR&period=invalid").statusCode())
         assertEquals(400,call("/rse/equity-history?tickers=bad").statusCode())
     }
+    @Test fun `statement PDFs use the existing private duplicate safe document workflow`() {
+        val (_,owner)=user();val (_,other)=user()
+        val bytes="%PDF-1.7\nsynthetic statement fixture\n%%EOF".toByteArray()
+        fun statementUpload(id: String,category: String="Statement")=call("/documents","POST",mapOf(
+            "uploadId" to id.repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString(bytes),
+            "metadata" to mapOf("category" to category,"documentDate" to "2026-09-30","label" to "BK Capital statement",
+                "instrumentName" to "Investment account statement","issuer" to "BK Capital")),owner)
+        val first=statementUpload("b")
+        assertEquals(200,first.statusCode(),first.body())
+        val id=data(first).text("documentId")
+        val duplicate=statementUpload("c")
+        assertEquals(200,duplicate.statusCode(),duplicate.body())
+        assertEquals(id,data(duplicate).text("documentId"))
+        val document=data(call("/documents",cookie=owner)).records("documents").single()
+        assertEquals("Statement",document["category"])
+        assertEquals("broker-statement.pdf",document["originalFileName"])
+        assertEquals(String(bytes),call("/documents/$id",cookie=owner).body())
+        assertEquals(404,call("/documents/$id",cookie=other).statusCode())
+        assertTrue(data(call("/documents",cookie=other)).records("documents").isEmpty())
+        val item=mapOf("kind" to "bond","date" to "2026-09-24","amount" to 1000000,"title" to "Synthetic bond debit","currency" to "RWF","broker" to "BK Capital")
+        val checked=call("/statement-items","POST",mapOf("items" to listOf(item)),owner)
+        assertEquals(200,checked.statusCode(),checked.body())
+        assertEquals("missing",data(checked).records("rows").single()["state"])
+        assertTrue(data(call("/purchases",cookie=owner)).records("purchases").isEmpty())
+        assertTrue(data(call("/equities",cookie=owner)).records("holdings").isEmpty())
+        assertEquals(400,statementUpload("d","Unsupported statement").statusCode())
+    }
+
     @Test fun `statement debits create reminders without inventing investment principal`() {
         val cookie=login()
         val item=mapOf("kind" to "bond","date" to "2026-10-24","amount" to 1200000,"title" to "Synthetic bond debit","currency" to "RWF","broker" to "BK Capital")
@@ -161,6 +189,10 @@ class GaboPortfolioApiApplicationTests {
         lifecycle.sync("owner",notificationToday())
         assertEquals(1,notifications.list("owner",null).records("notifications").count { it["kind"]=="documents" })
         val saved=data(call("/purchases","POST",bond("active"),cookie))["purchase"].record()
+        // A similar bond debit requires the investor's explicit decision, not an amount/date-only match.
+        val unresolved=data(call("/statement-items",cookie=cookie)).records("items").single()
+        assertEquals("review-required",unresolved["reconciliationStatus"])
+        assertEquals(200,call("/statement-items/${unresolved.text("id")}/resolve","POST",mapOf("action" to "link","purchaseId" to saved.text("id"),"reason" to "Checked the original allocation against this statement"),cookie).statusCode())
         assertTrue(data(call("/statement-items",cookie=cookie)).records("items").isEmpty())
         lifecycle.sync("owner",notificationToday())
         assertEquals(true,notifications.list("owner",null).records("notifications").first { it["kind"]=="documents" }["resolved"])
@@ -405,4 +437,85 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(400,send('f',issue+mapOf("couponDates" to listOf("2047-01-01"))).statusCode())
         assertEquals(400,send('f',issue+mapOf("amountSold" to -1)).statusCode())
     }
+    @Test fun `statement evidence retries manual corrections and account isolation preserve one financial event`() {
+        val (owner,cookie)=user();val (_,other)=user()
+        val bytes="%PDF-1.7\nsynthetic reconciliation source\n%%EOF".toByteArray()
+        val source=call("/documents","POST",mapOf("uploadId" to "f".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString(bytes),
+            "metadata" to mapOf("category" to "Statement","documentDate" to "2026-10-31","label" to "Synthetic statement","instrumentName" to "Investment account statement","issuer" to "BK Capital")),cookie)
+        assertEquals(200,source.statusCode(),source.body());val documentId=data(source).text("documentId")
+        assertEquals(201,call("/equities","POST",equity(),cookie).statusCode())
+        val share=mapOf("kind" to "equity","date" to "2026-09-24","amount" to 91100,"title" to "IMR","currency" to "RWF","broker" to "BK Capital","ticker" to "IMR","contractNote" to "20260004454#01","shares" to 1000,"pricePerShare" to 90,"rowNumber" to 1)
+        val movement=mapOf("kind" to "fee","date" to "2026-09-24","amount" to 50,"title" to "Statement fee","currency" to "RWF","broker" to "BK Capital","direction" to "debit","rowNumber" to 2)
+        val payload=mapOf("documentId" to documentId,"items" to listOf(share),"movements" to listOf(movement))
+        assertEquals(400,call("/statement-items","POST",payload+mapOf("movements" to "not a list"),cookie).statusCode())
+        assertEquals(400,call("/statement-items","POST",payload+mapOf("documentId" to 123),cookie).statusCode())
+        repeat(2) {
+            val response=call("/statement-items","POST",payload,cookie);assertEquals(200,response.statusCode(),response.body())
+            assertEquals("matched",data(response).records("rows").first()["reconciliationStatus"])
+            assertEquals("evidence-only",data(response).records("rows").last()["reconciliationStatus"])
+        }
+        assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_statement_items WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_statement_sources WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(1,data(call("/equities",cookie=cookie)).records("holdings").size)
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+        assertEquals(404,call("/statement-items?documentId=$documentId",cookie=other).statusCode())
+        val owned=data(call("/statement-items?documentId=$documentId",cookie=cookie)).records("items")
+        assertEquals(documentId,owned.first().records("sources").single()["documentId"])
+        assertEquals(String(bytes),call("/documents/$documentId",cookie=cookie).body())
+
+        val purchase=data(call("/purchases","POST",bond("active"),cookie))["purchase"].record()
+        val debit=mapOf("kind" to "bond","date" to "2026-10-26","amount" to 1200000,"title" to "Bond Cost","currency" to "RWF","broker" to "BK Capital","rowNumber" to 3)
+        val pending=call("/statement-items","POST",mapOf("documentId" to documentId,"items" to listOf(debit)),cookie)
+        val row=data(pending).records("rows").single();val id=row.text("id")
+        assertEquals("review-required",row["reconciliationStatus"])
+        val decision=mapOf("action" to "link","purchaseId" to purchase.text("id"),"reason" to "Verified original allocation and statement","expectedDecisionAt" to "")
+        repeat(2) { val response=call("/statement-items/$id/resolve","POST",decision,cookie);assertEquals(200,response.statusCode(),response.body()) }
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_decisions WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(404,call("/statement-items/$id/resolve","POST",decision,other).statusCode())
+        val matched=data(call("/statement-items?documentId=$documentId",cookie=cookie)).records("items").single { it.text("id")==id }
+        assertEquals("manual",matched["matchMethod"])
+        assertEquals(200,call("/purchases/${purchase.text("id")}","PUT",bond("active")+mapOf("faceValue" to 1300000),cookie).statusCode())
+        val changed=data(call("/statement-items?documentId=$documentId",cookie=cookie)).records("items").single { it.text("id")==id }
+        assertEquals("review-required",changed["reconciliationStatus"])
+        assertEquals(200,call("/purchases/${purchase.text("id")}","PUT",bond("active"),cookie).statusCode())
+        val at=matched.records("decisions").last().text("at")
+        assertEquals(200,call("/statement-items/$id/resolve","POST",mapOf("action" to "clear","reason" to "Correcting this earlier association","expectedDecisionAt" to at),cookie).statusCode())
+        assertEquals(409,call("/statement-items/$id/resolve","POST",decision+mapOf("reason" to "A stale different decision"),cookie).statusCode())
+        val corrected=data(call("/statement-items?documentId=$documentId",cookie=cookie)).records("items").single { it.text("id")==id }
+        assertEquals(2,corrected.records("decisions").size)
+        assertEquals("review-required",corrected["reconciliationStatus"])
+        assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
+    }
+
+
+    @Test fun `equity imports preserve their private contract PDF and reject another account source`() {
+        val (_,a)=user();val (_,b)=user()
+        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic share contract".toByteArray()),
+            "metadata" to mapOf("category" to "Share contract","documentDate" to "2026-09-24","label" to "Synthetic share contract","instrumentName" to "Synthetic security","issuer" to "BK Capital")),a)
+        assertEquals(200,source.statusCode(),source.body())
+        val id=data(source).text("documentId")
+        val created=call("/equities","POST",equity()+mapOf("contractDocumentId" to id),a)
+        assertEquals(201,created.statusCode(),created.body())
+        assertEquals(id,data(created)["holding"].record()["contractDocumentId"])
+        assertEquals(400,call("/equities","POST",equity()+mapOf("contractDocumentId" to id),b).statusCode())
+        assertTrue(data(call("/equities",cookie=b)).records("holdings").isEmpty())
+    }
+
+    @Test fun `reimporting a legacy reminder attaches its source once without duplicating it`() {
+        val (owner,cookie)=user()
+        val item=mapOf("kind" to "bond","date" to "2026-10-26","amount" to 1200000,"title" to "Bond Cost","currency" to "RWF","broker" to "BK Capital")
+        val legacy=data(call("/statement-items","POST",mapOf("items" to listOf(item)),cookie)).records("rows").single().text("id")
+        val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic legacy statement".toByteArray()),
+            "metadata" to mapOf("category" to "Statement","documentDate" to "2026-10-31","label" to "Statement","instrumentName" to "Investment statement","issuer" to "BK Capital")),cookie)
+        val id=data(source).text("documentId")
+        repeat(2) {
+            val response=call("/statement-items","POST",mapOf("documentId" to id,"items" to listOf(item+mapOf("rowNumber" to 1))),cookie)
+            assertEquals(200,response.statusCode(),response.body())
+            assertEquals(legacy,data(response).records("rows").single()["id"])
+        }
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_items WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_sources WHERE owner_id=?",Int::class.java,owner))
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+    }
+
 }
