@@ -46,3 +46,8 @@ See [docs/MIGRATION.md](docs/MIGRATION.md). Never point a test run or initial de
 - RSE reads use fixed upstream URLs, request/body limits and short timeouts. Quotes are cached for fifteen minutes; failures can use a clearly marked stale quote for up to one day. Missing historical dates stay missing; contract execution prices remain distinct from official closing prices.
 - Private PDFs currently remain in PostgreSQL, matching the website. Plan database capacity and private backups; object storage can be added later without changing client URLs.
 - Choose and document the actual storage locations, backups and hosting providers before processing invited users' data in the new deployment.
+
+
+## Security audit follow-up
+
+The 30 October 2026 local audit adds account-scoped contract-price history, owner-only shared issuance publication, atomic scheduled receipt/reminder work, PDF envelope validation and targeted dependency patches. See [API boundaries](docs/API.md) and the companion KMP checkout's `docs/security/SECURITY_AUDIT.md`, `DEPENDENCIES.md`, `OPERATIONS.md` and `RWANDA_DATA_PROTECTION.md`. These are tested local changes, not proof of a production deployment, restore exercise or legal compliance.
