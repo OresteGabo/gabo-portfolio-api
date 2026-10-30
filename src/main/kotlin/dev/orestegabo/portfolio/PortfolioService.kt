@@ -61,7 +61,9 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     }
     @Transactional fun saveShare(owner: String,raw: Record): Record {
         lockAccount(db,owner)
-        val p = validation.equity(raw)+mapOf("id" to newId(),"createdAt" to Instant.now().toString())
+        val documentId=raw.text("contractDocumentId").takeIf(String::isNotBlank)
+        if(documentId!=null)checkApi(uuid(documentId) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE owner_id=? AND id=?::uuid AND metadata->>'category'='Share contract'",owner,documentId).isNotEmpty(),"Share contract PDF not found.")
+        val p = validation.equity(raw)+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
         val contract = p.text("contractNote").takeIf { it.isNotBlank() }?.let { "${normalized(p.text("broker"))}|${normalized(it)}" }
         db.update("INSERT INTO equity_purchases(id,owner_id,dedup_key,contract_key,report_key,holding) VALUES (?::uuid,?,?,?,?,?::jsonb)",p["id"],owner,validation.equityKey(p),contract,p.text("tradeReportId").ifBlank { null },json.write(p))
         return p

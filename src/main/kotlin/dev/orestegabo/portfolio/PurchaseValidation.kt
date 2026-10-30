@@ -35,7 +35,7 @@ class PurchaseValidation(json: JsonCodec) {
         val error = "Check the purchase details and try again."
         for (key in listOf("tenorYears","faceValue","pricePercent","accruedInterestPaid","feesPaid","couponRate","withholdingTaxRate","couponFrequency")) {
             val supplied = when {
-                key == "withholdingTaxRate" && type == "treasury" -> BigDecimal("0.05")
+                key == "withholdingTaxRate" && type == "treasury" && raw[key] == null -> BigDecimal("0.05")
                 key in listOf("accruedInterestPaid","feesPaid","withholdingTaxRate") && raw[key] == null -> BigDecimal.ZERO
                 else -> raw[key]
             }
@@ -54,6 +54,7 @@ class PurchaseValidation(json: JsonCodec) {
         checkApi(p.number("pricePercent")>0 && p.number("pricePercent")<=1000 && p.number("accruedInterestPaid")>=0 && p.number("feesPaid")>=0 && p.number("couponRate") in 0.0..1.0 && p.number("withholdingTaxRate") in 0.0..1.0,error)
         val frequency = p.decimal("couponFrequency")
         checkApi(frequency.stripTrailingZeros().scale()<=0 && p.number("couponFrequency") in 1.0..12.0,error)
+        checkApi(12%frequency.toInt()==0 || p.strings("couponDates").isNotEmpty(),"Provide published coupon dates for this frequency.")
         checkApi(p.text("scheduleConfidence") in listOf("confirmed","estimated") && (p.text("scheduleConfidence")!="confirmed" || p.strings("couponDates").isNotEmpty()),error)
         checkApi(p.text("broker").length<=120 && p.text("accountReference").length<=120 && p.text("sourceUrl").length<=1000 && p.text("notes").length<=1000 && p.text("status") in listOf("submitted","active","sold","matured"),error)
         checkApi(p.text("sourceUrl").isEmpty() || runCatching { URI(p.text("sourceUrl")).let { it.scheme in listOf("http","https") && it.host != null } }.getOrDefault(false),error)
