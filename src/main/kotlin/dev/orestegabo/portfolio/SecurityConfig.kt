@@ -35,7 +35,7 @@ class SecurityConfig(
         val cors = CorsConfiguration().apply {
             allowedOrigins = origins
             allowedMethods = listOf("GET", "POST", "PUT", "DELETE", "OPTIONS")
-            allowedHeaders = listOf("Content-Type", "Authorization")
+            allowedHeaders = listOf("Content-Type", "Authorization", "X-Request-ID")
             allowCredentials = true
             maxAge = 3600
         }
@@ -77,7 +77,7 @@ class SecurityConfig(
                             if (bytes.isNotEmpty()) checkApi(request.contentType?.substringBefore(';')?.trim()?.equals("application/json", true) == true, "Expected a JSON request body.", 415)
                             bounded = BodyRequest(request, bytes)
                         }
-                        auth.session(request)?.let { account ->
+                        RequestPerformance.measure("session_validation") { auth.session(request) }?.let { account ->
                             SecurityContextHolder.getContext().authentication = UsernamePasswordAuthenticationToken(account, null, listOf(SimpleGrantedAuthority(if (account.owner) "ROLE_OWNER" else "ROLE_USER")))
                         }
                         chain.doFilter(bounded, response)
@@ -109,5 +109,6 @@ private class BodyRequest(request: HttpServletRequest, private val bytes: ByteAr
     override fun getReader() = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8))
 }
 
-fun currentAccount(): Account = SecurityContextHolder.getContext().authentication?.principal as? Account ?: throw ApiError(401, "Authentication required.")
+fun currentAccountOrNull(): Account? = SecurityContextHolder.getContext().authentication?.principal as? Account
+fun currentAccount(): Account = currentAccountOrNull() ?: throw ApiError(401, "Authentication required.")
 fun currentOwner(): Account = currentAccount().also { checkApi(it.owner, "Owner access required.", 403) }

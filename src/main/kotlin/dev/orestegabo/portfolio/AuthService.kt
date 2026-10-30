@@ -64,8 +64,10 @@ class AuthService(
     fun account(id: String): Account? = if (id == "owner") owner() else friend()?.takeIf { it.id == id } ?: db.query("SELECT id,email,password_hash FROM bond_users WHERE id=? AND disabled_at IS NULL", { r, _ -> Account(r.getString(1), r.getString(2), r.getString(3)) }, id).firstOrNull()
     fun byEmail(email: String): Account? = owner()?.takeIf { it.email == email } ?: friend()?.takeIf { it.email == email } ?: db.query("SELECT id,email,password_hash FROM bond_users WHERE email=? AND disabled_at IS NULL", { r, _ -> Account(r.getString(1), r.getString(2), r.getString(3)) }, email).firstOrNull()
     fun authenticate(email: String, password: String): Account? {
-        val account = byEmail(email)
-        val valid = Passwords.verify(password, account?.passwordHash ?: "scrypt:${"0".repeat(32)}:${"0".repeat(128)}")
+        val account = RequestPerformance.measure("account_lookup") { byEmail(email) }
+        val valid = RequestPerformance.measure("password_verify") {
+            Passwords.verify(password, account?.passwordHash ?: "scrypt:${"0".repeat(32)}:${"0".repeat(128)}")
+        }
         return account?.takeIf { valid }
     }
     fun session(request: HttpServletRequest): Account? {

@@ -31,9 +31,9 @@ fun newId() = UUID.randomUUID().toString()
 
 @Component
 class JsonCodec(val mapper: JsonMapper) {
-    fun write(value: Any?): String = mapper.writeValueAsString(value)
-    fun read(value: String): Record = mapper.readValue(value, Map::class.java).record()
-    fun list(value: String): List<Record> = mapper.readValue(value, List::class.java).map { it.record() }
+    fun write(value: Any?): String = RequestPerformance.measure("json_encode") { mapper.writeValueAsString(value) }
+    fun read(value: String): Record = RequestPerformance.measure("json_decode") { mapper.readValue(value, Map::class.java).record() }
+    fun list(value: String): List<Record> = RequestPerformance.measure("json_decode") { mapper.readValue(value, List::class.java).map { it.record() } }
 }
 
 @RestControllerAdvice

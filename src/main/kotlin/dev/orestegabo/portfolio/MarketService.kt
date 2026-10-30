@@ -19,14 +19,14 @@ interface MarketPages { fun get(path: String): String }
 @Component
 class RsePages: MarketPages {
     private val client=HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).followRedirects(HttpClient.Redirect.NEVER).build()
-    override fun get(path: String): String {
+    override fun get(path: String): String = RequestPerformance.measure("rse_http") {
         require(path.startsWith("/") && !path.startsWith("//"))
         val request=HttpRequest.newBuilder(URI("https://rse.rw$path")).timeout(Duration.ofSeconds(8)).header("Accept","text/html").header("User-Agent","Gabo Portfolio optional market reader").GET().build()
         val response=client.send(request,HttpResponse.BodyHandlers.ofInputStream())
         response.body().use {
             check(response.statusCode()==200)
             val bytes=it.readNBytes(1500001); check(bytes.size<=1500000)
-            return String(bytes,Charsets.UTF_8)
+            String(bytes,Charsets.UTF_8)
         }
     }
 }

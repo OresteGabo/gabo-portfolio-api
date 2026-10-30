@@ -1,0 +1,15 @@
+# Unlock request diagnostics
+
+The mobile unlock investigation and measured controlled before/after results are in the companion KMP checkout's `docs/UNLOCK_PERFORMANCE.md`. Mobile navigation used to wait for optional portfolio enrichment; this backend change does not assert that the deployed service caused a reported twenty-second delay.
+
+The session security filter already validates the cookie. `AuthController.session` now reads that per-request authenticated principal instead of running the same database validation twice. No session result is cached across requests; expiry, disabled users and credential version remain checked by the filter. Other API contracts and financial calculations are unchanged.
+
+Set `GABO_PERFORMANCE_DIAGNOSTICS=true` temporarily to capture `[UnlockPerformance]` request logs. Defaults to false. `X-Request-ID` is echoed; incoming values must match 8–64 ASCII letters/digits/hyphens, otherwise a UUID is generated. The allowed CORS header is additive. No request body, SQL, bind values, account, cookie, query string or exception content is logged. Non-allowlisted routes use a generic label.
+
+`System.nanoTime` measures servlet handling (including security and response writing), session validation, account lookup, password verification, session creation, security-notification queuing, upstream RSE HTTP, explicit JsonCodec encode/decode, JDBC connection acquisition and statement execution. JDBC wrapping is installed only when the property is enabled, delegates calls/exceptions/results and performs no extra queries. Nested stages are not additive. SQL row mapping and Spring MVC's own Jackson conversion are covered by request total rather than a separate complete serialization metric. Container boot and ingress queuing occur before the filter.
+
+Match a mobile HTTP request ID to these logs. If client duration is high but servlet duration low, inspect proxy/ingress/network and container boot timing. If `db_connection` is high, inspect pool contention, connection setup and database wake-up. If `db_execute` is high, collect query plans/lock evidence in an appropriate isolated environment before changing indexes. If `rse_http` is high, the optional market fetch should affect quotes, not the authenticated UI. Do not tune pool sizes or minimum instances on speculation.
+
+The cloudrun profile permits zero idle Hikari connections, caps the pool at two and allows a 15-second acquisition wait. The source alone does not establish deployed values or prove any wait. Existing timeouts and production infrastructure are unchanged; no migration is required.
+
+Verification: all 42 Spring tests and `bootJar` passed against a new disposable loopback PostgreSQL 18 cluster with Flyway V1–V8 and diagnostics enabled. Regressions cover correlation sanitization, failure cleanup and unchanged JDBC results. Existing real HTTP session tests cover opaque cookies, expiry/revocation and credential changes. A synthetic unpooled local datasource cannot benchmark deployed Hikari or Neon. No production database or account was accessed. Turn diagnostics off after the investigation and keep captured logs private and short-lived.
