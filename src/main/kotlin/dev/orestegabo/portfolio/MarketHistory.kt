@@ -25,7 +25,7 @@ class MarketHistory(private val db: JdbcTemplate,private val json: JsonCodec) {
         db.update("""INSERT INTO equity_market_collection(id,attempted_at,succeeded_at,market_date,status) VALUES(true,?::timestamptz,CASE WHEN ?='saved' THEN ?::timestamptz ELSE NULL END,?::date,?)
             ON CONFLICT(id) DO UPDATE SET attempted_at=EXCLUDED.attempted_at,succeeded_at=COALESCE(EXCLUDED.succeeded_at,equity_market_collection.succeeded_at),market_date=COALESCE(EXCLUDED.market_date,equity_market_collection.market_date),status=EXCLUDED.status WHERE equity_market_collection.attempted_at<=EXCLUDED.attempted_at""",start.toString(),status,start.toString(),day,status)
     }
-    fun history(tickers: List<String>,period: String): Record {
+    fun history(tickers: List<String>,period: String,owner: String? = null): Record {
         val today=LocalDate.now(ZoneOffset.ofHours(2)); val cutoff=when(period) { "month"->today.minusMonths(1); "year"->today.minusYears(1); else->LocalDate.of(1900,1,1) }
         val rows=db.queryForList("""WITH ranked AS (
             SELECT ticker,observed_date,closing_price,observed_at,count(*) OVER(PARTITION BY ticker) AS total,
@@ -34,20 +34,20 @@ class MarketHistory(private val db: JdbcTemplate,private val json: JsonCodec) {
             FROM equity_market_observations WHERE ticker IN(SELECT jsonb_array_elements_text(?::jsonb)) AND observed_date BETWEEN ?::date AND ?::date)
             SELECT ticker,observed_date::text AS date,closing_price AS closing,observed_at,total>400 AS aggregated FROM ranked WHERE total<=400 OR first_in_month=1 OR last_in_month=1 ORDER BY ticker,observed_date""",json.write(tickers),cutoff.toString(),today.toString())
         val observations=rows.map { mapOf("ticker" to it["ticker"],"date" to it["date"],"closing" to it["closing"],"observedAt" to (it["observed_at"] as java.sql.Timestamp).toInstant().toString()) }
-        val trades=tradeHistory(tickers,cutoff.toString(),today.toString())
-        return mapOf("available" to true,"resolution" to if(rows.any { it["aggregated"]==true })"monthly" else "daily","observations" to observations,"tradeHistoryAvailable" to true,"tradeObservations" to trades)
+        val trades=if(owner==null) emptyList() else tradeHistory(owner,tickers,cutoff.toString(),today.toString())
+        return mapOf("available" to true,"resolution" to if(rows.any { it["aggregated"]==true })"monthly" else "daily","observations" to observations,"tradeHistoryAvailable" to (owner!=null),"tradeObservations" to trades)
     }
-    // Public price evidence only. Account identity, contracts, PDFs, quantities and totals never leave this projection.
-    private fun tradeHistory(tickers: List<String>,from: String,through: String): List<Record> = db.queryForList("""WITH prices AS (
+    // Contract prices remain private account evidence, including their dates and range. Public history uses exchange observations only.
+    private fun tradeHistory(owner: String,tickers: List<String>,from: String,through: String): List<Record> = db.queryForList("""WITH prices AS (
         SELECT DISTINCT holding->>'ticker' AS ticker,holding->>'tradeDate' AS date,
         CASE WHEN jsonb_typeof(holding->'pricePerShare')='number' THEN (holding->>'pricePerShare')::numeric END AS price
-        FROM equity_purchases WHERE holding->>'exchange'='RSE' AND holding->>'currency'='RWF' AND length(trim(holding->>'contractNote'))>0 AND length(trim(holding->>'broker'))>0
+        FROM equity_purchases WHERE owner_id=? AND holding->>'exchange'='RSE' AND holding->>'currency'='RWF' AND length(trim(holding->>'contractNote'))>0 AND length(trim(holding->>'broker'))>0
         ), daily AS (SELECT ticker,date,percentile_disc(0.5) WITHIN GROUP(ORDER BY price) AS price,min(price) AS low,max(price) AS high FROM prices
         WHERE ticker IN(SELECT jsonb_array_elements_text(?::jsonb)) AND date BETWEEN ? AND ? AND price>0 AND price<=1e13 GROUP BY ticker,date), ranked AS (
         SELECT *,count(*) OVER(PARTITION BY ticker) AS total,row_number() OVER(PARTITION BY ticker,left(date,7) ORDER BY date) AS first,
         row_number() OVER(PARTITION BY ticker,left(date,7) ORDER BY date DESC) AS last,row_number() OVER(PARTITION BY ticker,left(date,7) ORDER BY low,date) AS lowest,
         row_number() OVER(PARTITION BY ticker,left(date,7) ORDER BY high DESC,date) AS highest FROM daily)
-        SELECT ticker,date,price,low,high FROM ranked WHERE total<=400 OR first=1 OR last=1 OR lowest=1 OR highest=1 ORDER BY ticker,date""",json.write(tickers),from,through).filter { date(it.text("date"))!=null }.map { it+mapOf("source" to "contract") }
+        SELECT ticker,date,price,low,high FROM ranked WHERE total<=400 OR first=1 OR last=1 OR lowest=1 OR highest=1 ORDER BY ticker,date""",owner,json.write(tickers),from,through).filter { date(it.text("date"))!=null }.map { it+mapOf("source" to "contract") }
     fun recordBonds(trades: List<Record>,now: Instant) {
         for(t in trades) {
             val identity=MarketParser.identity(t.text("bond")); if(identity.isBlank())continue

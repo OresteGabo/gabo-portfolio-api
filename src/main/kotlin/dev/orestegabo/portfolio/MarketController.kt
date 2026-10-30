@@ -12,17 +12,17 @@ class MarketController(private val market: MarketService,private val history: Ma
     @Value("\${gabo.cron-secret:}") private val cronSecret: String,
     @Value("\${gabo.snapshot-secret:}") private val snapshotSecret: String) {
     @GetMapping("/quotes") fun quotes(@RequestParam kind: String,@RequestParam(required=false) refresh: String?): Record {
-        val data=market.quotes(kind,refresh!=null)
+        val data=market.quotes(kind,refresh!=null && currentAccountOrNull()!=null)
         // Optional history writes must never make usable current quotes fail.
         if(kind=="equities") runCatching { history.record(data) }
         return data
     }
-    @GetMapping("/market") fun market(@RequestParam(required=false) refresh: String?)=market.market(refresh!=null)
+    @GetMapping("/market") fun market(@RequestParam(required=false) refresh: String?)=market.market(refresh!=null && currentAccountOrNull()!=null)
     @GetMapping("/equity-history") fun history(@RequestParam tickers: String,@RequestParam(defaultValue="all") period: String): Record {
         val symbols=tickers.split(',').distinct()
         checkApi(period in listOf("month","year","all"),"Choose month, year, or all history.")
         checkApi(symbols.size in 1..10 && symbols.all { Regex("[A-Z][A-Z0-9]{1,9}").matches(it) },"Choose up to ten stock symbols.")
-        return history.history(symbols,period)
+        return history.history(symbols,period,currentAccountOrNull()?.id)
     }
     private fun authorize(value: String?,secret: String) { checkApi(secret.isNotBlank() && MessageDigest.isEqual((value ?: "").toByteArray(),"Bearer $secret".toByteArray()),"Unauthorized.",401) }
     @GetMapping("/daily") fun daily(@RequestHeader("Authorization",required=false) authorization: String?): ResponseEntity<Record> {

@@ -25,6 +25,8 @@ class GaboPortfolioApiApplicationTests {
     @Autowired lateinit var auth: AuthService
     @Autowired lateinit var lifecycle: LifecycleNotifications
     @Autowired lateinit var notifications: PriceNotifications
+    @Autowired lateinit var marketService: MarketService
+    @Autowired lateinit var marketTestPages: CountingMarketTestPages
     @Autowired lateinit var history: MarketHistory
     @Autowired lateinit var importer: WebSeedImporter
     private val http=HttpClient.newHttpClient()
@@ -137,20 +139,40 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(data(small)["documentId"],data(duplicate)["documentId"])
         assertFalse(call("/documents",cookie=cookie).body().contains("content\""))
     }
-    @Test fun `share fees and duplicates are validated while public history exposes only prices`() {
-        val (_,cookie)=user()
+    @Test fun `anonymous refresh parameters cannot repeatedly bypass the market cache`() {
+        val cookie=login()
+        marketService.quotes("equities",true)
+        val first=marketTestPages.reads.get()
+        assertEquals(200,call("/rse/quotes?kind=equities&refresh=1").statusCode())
+        assertEquals(first,marketTestPages.reads.get())
+        assertEquals(200,call("/rse/quotes?kind=equities&refresh=1",cookie=cookie).statusCode())
+        assertTrue(marketTestPages.reads.get()>first)
+        marketService.market(true)
+        val second=marketTestPages.reads.get()
+        assertEquals(200,call("/rse/market?refresh=1").statusCode())
+        assertEquals(second,marketTestPages.reads.get())
+    }
+
+    @Test fun `private contract prices remain account scoped and absent from public history`() {
+        val (_,cookie)=user();val (_,other)=user()
         assertEquals(400,call("/equities","POST",equity()+mapOf("totalCharges" to 10),cookie).statusCode())
-        val result=call("/equities","POST",equity(),cookie);assertEquals(201,result.statusCode(),result.body())
+        assertEquals(201,call("/equities","POST",equity(),cookie).statusCode())
         assertEquals(409,call("/equities","POST",equity(),cookie).statusCode())
-        val body=call("/rse/equity-history?tickers=IMR&period=all")
-        assertEquals(200,body.statusCode(),body.body())
-        val row=data(body).records("tradeObservations").single()
-        assertEquals(90.0,row.number("price"));assertEquals("contract",row["source"])
-        assertEquals(setOf("ticker","date","price","low","high","source"),row.keys)
-        assertFalse(body.body().contains("BK Capital"));assertFalse(body.body().contains("20260004454"))
+        val otherTrade=equity()+mapOf("pricePerShare" to 134,"grossConsideration" to 134000,"netAmountPayable" to 135100)
+        assertEquals(201,call("/equities","POST",otherTrade,other).statusCode())
+        val path="/rse/equity-history?tickers=IMR&period=all"
+        val public=data(call(path))
+        assertTrue(public.records("tradeObservations").isEmpty())
+        assertEquals(false,public["tradeHistoryAvailable"])
+        val own=data(call(path,cookie=cookie)).records("tradeObservations").single()
+        assertEquals(90.0,own.number("price"));assertEquals(90.0,own.number("high"))
+        val theirs=data(call(path,cookie=other)).records("tradeObservations").single()
+        assertEquals(134.0,theirs.number("price"));assertEquals(134.0,theirs.number("low"))
+        assertEquals(setOf("ticker","date","price","low","high","source"),own.keys)
         assertEquals(400,call("/rse/equity-history?tickers=IMR&period=invalid").statusCode())
         assertEquals(400,call("/rse/equity-history?tickers=bad").statusCode())
     }
+
     @Test fun `statement PDFs use the existing private duplicate safe document workflow`() {
         val (_,owner)=user();val (_,other)=user()
         val bytes="%PDF-1.7\nsynthetic statement fixture\n%%EOF".toByteArray()

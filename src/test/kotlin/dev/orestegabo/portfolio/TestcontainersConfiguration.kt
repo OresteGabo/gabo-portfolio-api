@@ -12,6 +12,9 @@ import org.testcontainers.utility.DockerImageName
 
 @TestConfiguration(proxyBeanMethods = false)
 class TestcontainersConfiguration {
+    @Bean
+    @org.springframework.context.annotation.Primary
+    fun marketTestPages() = CountingMarketTestPages()
 
     @Bean
     @ServiceConnection
@@ -28,5 +31,14 @@ class TestcontainersConfiguration {
             "Local integration tests require a disposable loopback struct_test_ database."
         }
         return DriverManagerDataSource(url,"struct_test","")
+    }
+}
+
+/** Synthetic upstream: integration tests never fetch a live market website. */
+class CountingMarketTestPages : MarketPages {
+    val reads = java.util.concurrent.atomic.AtomicInteger()
+    override fun get(path: String): String {
+        reads.incrementAndGet()
+        return "<html><table><tbody><tr><td>Synthetic IMR</td><td>90</td><td>89</td><td>1</td><td>1</td><td>90</td></tr></tbody></table></html>"
     }
 }
