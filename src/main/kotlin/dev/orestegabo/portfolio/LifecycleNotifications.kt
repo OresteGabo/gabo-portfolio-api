@@ -12,6 +12,36 @@ import java.math.RoundingMode
 val notificationCategories=setOf("prices","coupons","maturities","subscriptions","pending","documents","targets","reports","security")
 fun notificationToday(): LocalDate=LocalDate.now(ZoneOffset.ofHours(2))
 
+/** Existing lifecycle rules, exposed as pure functions for cross-runtime financial fixtures. */
+internal fun bondCouponSchedule(p: Record): List<LocalDate> {
+    val start=date(p.text("purchaseDate")) ?: return emptyList()
+    val end=date(p.text("maturityDate")) ?: return emptyList()
+    val published=p.strings("couponDates")
+    if(published.isNotEmpty()) return published.mapNotNull(::date).distinct().filter { it>start && it<=end }.sorted()
+    val frequency=p.number("couponFrequency",2.0)
+    if(frequency%1.0!=0.0 || frequency !in 1.0..12.0 || 12%frequency.toInt()!=0 || end<=start || end>start.plusYears(100)) return emptyList()
+    val interval=12L/frequency.toLong()
+    val dates=mutableListOf<LocalDate>()
+    val first=date(p.text("firstCouponDate"))
+    if(first!=null) {
+        if(first>end || first<start.minusYears(100))return emptyList()
+        var step=0L;var day: LocalDate=first
+        while(day<=end) { if(day>start)dates+=day;day=first.plusMonths(interval * ++step) }
+        if(dates.isNotEmpty() && dates.last()!=end)dates+=end
+    } else {
+        var step=0L;var day=end
+        while(day>start) { dates+=day;day=end.minusMonths(interval * ++step) }
+    }
+    return dates.distinct().sorted()
+}
+
+internal fun netCouponAmount(p: Record): BigDecimal {
+    val frequency=p.decimal("couponFrequency","2")
+    require(frequency>BigDecimal.ZERO)
+    return (p.decimal("faceValue")*p.decimal("couponRate")*(BigDecimal.ONE-p.decimal("withholdingTaxRate","0.05")))
+        .divide(frequency,2,RoundingMode.HALF_UP)
+}
+
 @Service
 class LifecycleNotifications(private val db: JdbcTemplate,
                              private val json: JsonCodec,
@@ -39,18 +69,8 @@ class LifecycleNotifications(private val db: JdbcTemplate,
                 monthly_target=EXCLUDED.monthly_target""",owner,json.write(categories),auto,auto,(target as Number).toLong())
         return preferences(owner)
     }
-    fun schedule(p: Record): List<LocalDate> {
-        val start=date(p.text("purchaseDate")) ?: return emptyList();val end=date(p.text("maturityDate")) ?: return emptyList()
-        val explicit=p.strings("couponDates").mapNotNull(::date).distinct().filter { it>start && it<=end }.sorted()
-        if(explicit.isNotEmpty())return explicit
-        val interval=(12.0/p.number("couponFrequency",2.0).coerceAtLeast(1.0)).toInt().coerceAtLeast(1).toLong()
-        val dates=mutableListOf<LocalDate>();val first=date(p.text("firstCouponDate"))
-        if(first!=null) { var d: LocalDate=first;while(d<=end && dates.size<300) { if(d>start)dates+=d;d=d.plusMonths(interval) };if(dates.isNotEmpty() && dates.last()!=end)dates+=end }
-        else { var d=end;while(d>start && dates.size<300) { dates+=d;d=d.minusMonths(interval) } }
-        return dates.distinct().sorted()
-    }
-    private fun amount(p: Record): BigDecimal=(p.decimal("faceValue")*p.decimal("couponRate")*(BigDecimal.ONE-p.decimal("withholdingTaxRate","0.05")))
-        .divide(p.decimal("couponFrequency","2").max(BigDecimal.ONE),0,RoundingMode.DOWN)
+    fun schedule(p: Record): List<LocalDate> = bondCouponSchedule(p)
+    private fun amount(p: Record): BigDecimal = netCouponAmount(p)
     fun receipts(owner: String): List<Record> = db.queryForList("""SELECT r.purchase_id::text AS "purchaseId",r.due_date::text AS "dueDate",r.amount,r.received,r.method,b.currency,r.updated_at::text AS "updatedAt" FROM coupon_receipts r JOIN bond_purchases b ON b.id=r.purchase_id WHERE r.owner_id=? ORDER BY r.due_date DESC""",owner)
     @Transactional fun receive(owner: String,id: String,due: String,received: Boolean,today: LocalDate=notificationToday()): Record {
         lockAccount(db,owner)
