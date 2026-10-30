@@ -35,8 +35,10 @@ class PortfolioController(private val portfolio: PortfolioService,private val do
         val safe=name.replace(Regex("[^a-zA-Z0-9._ -]"),"_")
         return ResponseEntity.ok().contentType(MediaType.APPLICATION_PDF).header(HttpHeaders.CONTENT_DISPOSITION,"attachment; filename=\"$safe\"").header("X-Content-Type-Options","nosniff").body(bytes)
     }
-    @GetMapping("/statement-items") fun missing()=mapOf("items" to statements.missing(currentAccount().id))
+    @GetMapping("/statement-items") fun missing(@RequestParam(required=false) documentId: String?,@RequestParam(defaultValue="false") all: Boolean)=mapOf("items" to if(documentId!=null || all)statements.records(currentAccount().id,documentId) else statements.missing(currentAccount().id))
     @PostMapping("/statement-items") fun statement(@RequestBody body: Record)=mapOf("rows" to statements.reconcile(currentAccount().id,body))
+
+    @PostMapping("/statement-items/{id}/resolve") fun resolveStatement(@PathVariable id: String,@RequestBody body: Record)=mapOf("rows" to statements.resolve(currentAccount().id,id,body))
 
     private val reports=ConcurrentHashMap<String,Long>()
     private val log=LoggerFactory.getLogger(javaClass)
