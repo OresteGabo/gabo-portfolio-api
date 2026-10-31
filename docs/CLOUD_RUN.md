@@ -16,7 +16,11 @@ Save the JDBC hostname/database/user/password privately. Set `GABO_DATABASE_URL=
 
 For Cloud Run the image must support Linux amd64. Builds made by Google's build service have the correct target architecture; when building on an Apple Silicon Mac, use `docker buildx build --platform linux/amd64 ...` and publish to the chosen Artifact Registry repository. Do not upload an arm64-only local image.
 
-## Initial service settings
+## Current latency policy — 31 October 2026
+
+The owner approved keeping one service-level minimum instance warm after actual session/startup logs showed 17–21 second waits on scale-from-zero. Current setting is `--min=1`, request-based billing, existing maximum 1 and 1 CPU/1 GiB. Startup CPU boost was already enabled. This avoids routine idle teardown; it does not guarantee uninterrupted instances or prevent database/network delays. Thirty fully idle days have a US$12.96 baseline before shared free-tier discounts, active usage, other services and taxes at the reviewed Tier 1 rates. See [minimum instances](https://docs.cloud.google.com/run/docs/configuring/min-instances), [pricing](https://cloud.google.com/run/pricing) and PERFORMANCE.md. Preserve this service setting during updates. Reverting to `--min=0` is an explicit cost/latency tradeoff, not the current production policy.
+
+## Initial service settings (historical baseline)
 
 - Service: `gabo-portfolio-api`, project explicitly `gabo-portfolio-api`.
 - Region: choose deliberately near the database; `europe-west1` is an initial candidate, not a requirement.
@@ -44,3 +48,15 @@ Cloud Run requests/CPU/memory, builds, Artifact Registry, Secret Manager, logs, 
 `neon.ts`, `package.json` and its lock file manage Neon infrastructure only; the API remains Kotlin/Spring Boot. Build and test it with `./gradlew build`, not `npm run build`. Do not commit `.neon`, `.env*` or `node_modules`.
 
 After `npx neon@latest deploy` pulls `DATABASE_URL` and `DATABASE_URL_UNPOOLED` into the ignored `.env`, run `python3 scripts/prepare-neon-env.py`. It preserves the local PostgreSQL settings and writes separate private `.env.cloudrun` settings for Cloud Run. The generated settings keep JDBC/Hikari for queries and give Flyway the direct connection, with TLS hostname verification using Java’s trust store for both. The Cloud Run profile omits the statement_timeout startup option rejected by Neon’s pooler and bounds JdbcTemplate queries to ten seconds instead. Add the deployed API URL to `GABO_ALLOWED_ORIGINS` before mobile sign-in. Supply these settings through Cloud Run environment variables and Secret Manager; Spring does not load dotenv files automatically.
+
+## Approved monthly Cloud Run spend cap — 31 October 2026
+
+Created and independently read back `Struct Capital - Cloud Run monthly spend cap`, state `CONFIGURED`, **EUR 35 per calendar month** (the user explicitly selected euros because the billing account uses EUR). Scoped only to this project and Cloud Run, gross estimated spend excluding credits, with 50%/80%/100% current-spend alerts and project-level recipients enabled. Required billing-management APIs were enabled for configuration. Existing min=1 and container/deployment settings were preserved.
+
+Unlike an alerts-only budget, this cap can pause new Cloud Run usage and make the backend unavailable until reset/lifted. Enforcement is not instantaneous; overages and ongoing fixed costs remain possible. It excludes database, Vercel, image storage/builds and other service charges, so it is not a total-invoice guarantee. See [Google spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) and the companion KMP `docs/UNLOCK_COLD_START.md`.
+
+## Combined €35 target — subsequent 31 October update
+
+The user selected €35 total across providers. The existing Cloud Run enforcement cap was reduced to **€25/month**, state `CONFIGURED`; a separate **€35/month all-services Google project alerts-only budget** was created/read back. Both use EUR gross cost; 50%/80%/100% alerts remain enabled. Added service-level maximum 1 and verified minimum 1, ready revision and complete container template unchanged. The €10 remainder is planning headroom, not an enforced cap on image storage/logs/network/other fees.
+
+Linked production Neon is Free (datasource host matched the audited project); Vercel team is Hobby with no invoice add-ons returned. Existing free limits retained, no plan upgrade. Public repositories use standard hosted GitHub runners; paid account-level storage budgets were not changed. Domain renewals remain separate. Full verified scope and limits: companion KMP `docs/COST_CONTROLS.md`. **There is no guaranteed €35 combined invoice ceiling.** This section supersedes the earlier €35 Cloud Run-only allocation.

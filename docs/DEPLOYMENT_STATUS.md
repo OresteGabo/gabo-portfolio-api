@@ -5,7 +5,7 @@
 - API origin: https://gabo-portfolio-api-639858675564.europe-west1.run.app
 - Health: `/actuator/health`.
 - Public mobile and website origin remains https://bonds.orestegabo.dev. Vercel's `BONDS_API_ORIGIN` proxies `/api/bonds/*` to Spring before legacy routes. Browser/native cookies and the password-sharing domain stay on the existing origin.
-- Request-based CPU billing; zero minimum instances, maximum one instance, 1 CPU, 1 GiB, concurrency 8, timeout 120 seconds.
+- Request-based CPU billing; **one service-level minimum instance since 31 October 2026**, maximum one revision instance, 1 CPU, 1 GiB, concurrency 8, timeout 120 seconds. Initially minimum 0; changed with explicit user approval after production logs proved 17–21 second session cold starts. Revision/container settings and traffic were preserved; see PERFORMANCE.md and the companion KMP `docs/UNLOCK_COLD_START.md` for evidence, costs and verification limits.
 - Dedicated runtime identity `portfolio-runtime`; database password, owner password hash and cron secret in Secret Manager.
 - Neon production branch `plain-wind-27520547` / `production`. JDBC uses pooled queries, direct Flyway migrations, certificate and hostname verification. Four migrations applied.
 - The existing Vercel daily cron uses the same private `CRON_SECRET` as Spring. Existing cron path and schedule are retained.

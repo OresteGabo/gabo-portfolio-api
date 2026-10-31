@@ -1,5 +1,7 @@
 # Unlock request diagnostics
 
+**31 October 2026 production follow-up:** session request/startup logs now establish a routine scale-to-zero cold-start delay. The screenshot-time request took 17.438 s; a new instance started at request arrival and Spring reported ready about 17.066 s later. With explicit recurring-cost approval, service-level minimum instances changed from 0 to 1, preserving revision `gabo-portfolio-api-gh-41138071565-1` / Git SHA `3bc3dd568dfa0defc9279c6d50cbedd1b883c315` and its entire container template. No authentication bypass or image deployment. Six post-change anonymous proxy/direct checks returned 200 in 0.16–0.50 s; physical-device twenty-minute idle/authenticated SQL retesting remains. Full evidence and pricing assumptions: companion KMP `docs/UNLOCK_COLD_START.md`. The original investigation below predates this runtime attribution.
+
 The mobile unlock investigation and measured controlled before/after results are in the companion KMP checkout's `docs/UNLOCK_PERFORMANCE.md`. Mobile navigation used to wait for optional portfolio enrichment; this backend change does not assert that the deployed service caused a reported twenty-second delay.
 
 The session security filter already validates the cookie. `AuthController.session` now reads that per-request authenticated principal instead of running the same database validation twice. No session result is cached across requests; expiry, disabled users and credential version remain checked by the filter. Other API contracts and financial calculations are unchanged.
