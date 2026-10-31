@@ -44,6 +44,7 @@ class GaboPortfolioApiApplicationTests {
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
         db.execute("TRUNCATE bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
         val builder=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds$path"))
@@ -577,6 +578,72 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_items WHERE owner_id=?",Int::class.java,owner))
         assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_sources WHERE owner_id=?",Int::class.java,owner))
         assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+    }
+
+    @Test fun `statement bond creation reuses independent terms is atomic and refuses duplicate or uncertain purchases`() {
+        val (owner,cookie)=user();val (_,other)=user()
+        fun source(uploadId: Char,extra: String="") = data(call("/documents","POST",mapOf("uploadId" to uploadId.toString().repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString(("%PDF-1.7 synthetic bond statement $extra\n%%EOF").toByteArray()),
+            "metadata" to mapOf("category" to "Statement","documentDate" to "2026-09-30","label" to "Synthetic statement","instrumentName" to "Investment statement","issuer" to "BK Capital")),cookie)).text("documentId")
+        val document=source('a')
+        val item=mapOf("kind" to "bond","date" to "2026-07-17","amount" to 1500000,"title" to "July Bond Cost","currency" to "RWF","broker" to "BK Capital","rowNumber" to 1)
+        fun reconcile(doc: String)=call("/statement-items","POST",mapOf("documentId" to doc,"items" to listOf(item)),cookie)
+        val row=data(reconcile(document)).records("rows").single();val id=row.text("id")
+        assertEquals("unmatched",row["reconciliationStatus"])
+        val instrument=row.records("bondOptions").single()
+        assertEquals("fxd2-2026-7yr",instrument["id"])
+        val body=mapOf("instrumentId" to instrument["id"],"faceValue" to 1500000,"pricePercent" to 100,"accruedInterestPaid" to 0,
+            "feesPaid" to 10900,"withholdingTaxRate" to .05,"confirmed" to true,"reason" to "Verified bond and allocation in source statement","expectedDecisionAt" to "")
+        assertEquals(404,call("/statement-items/$id/bond","POST",body,other).statusCode())
+        assertEquals(400,call("/statement-items/$id/bond","POST",body+mapOf("confirmed" to false),cookie).statusCode())
+        assertEquals(400,call("/statement-items/$id/bond","POST",body+mapOf("instrumentId" to "fxd3-2026-10yr"),cookie).statusCode())
+        assertEquals(400,call("/statement-items/$id/bond","POST",body-"feesPaid",cookie).statusCode())
+        assertEquals(409,call("/statement-items/$id/bond","POST",body+mapOf("faceValue" to 1600000),cookie).statusCode())
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+        repeat(2) { val result=call("/statement-items/$id/bond","POST",body,cookie);assertEquals(200,result.statusCode(),result.body());assertEquals("matched",data(result).records("rows").single()["reconciliationStatus"]) }
+        val purchase=data(call("/purchases",cookie=cookie)).records("purchases").single()
+        assertEquals(instrument["id"],purchase["instrumentId"])
+        assertEquals(document,purchase["statementDocumentId"])
+        assertEquals(1500000.0,purchase.number("faceValue"));assertEquals(1510900.0,purchase.number("amountInvested"))
+        assertEquals(.115,purchase.number("couponRate"));assertEquals(instrument["couponDates"],purchase["couponDates"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_statement_decisions WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(409,call("/statement-items/$id/bond","POST",body+mapOf("feesPaid" to 11000),cookie).statusCode())
+        val repeated=data(reconcile(document)).records("rows").single();assertEquals("matched",repeated["reconciliationStatus"])
+        val overlapping=data(reconcile(source('b',"overlapping period"))).records("rows").single()
+        assertEquals("review-required",overlapping["reconciliationStatus"])
+        assertEquals(409,call("/statement-items/${overlapping.text("id")}/bond","POST",body,cookie).statusCode())
+        assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
+        assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_instruments WHERE id LIKE 'fxd%'",Int::class.java))
+    }
+
+    @Test fun `statement without original source cannot create a financial holding`() {
+        val (_,cookie)=user()
+        val item=mapOf("kind" to "bond","date" to "2026-07-17","amount" to 1500000,"title" to "July Bond Cost","currency" to "RWF","broker" to "BK Capital")
+        val row=data(call("/statement-items","POST",mapOf("items" to listOf(item)),cookie)).records("rows").single()
+        assertTrue(row.records("bondOptions").isEmpty())
+        assertEquals(400,call("/statement-items/${row.text("id")}/bond","POST",mapOf("confirmed" to true),cookie).statusCode())
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+    }
+
+    @Test fun `shared wrapped statement parser output is accepted without creating or duplicating holdings`() {
+        val (owner,cookie)=user()
+        val parsed=javaClass.getResourceAsStream("/bk-statement-wrapped.json")!!.bufferedReader().use { json.read(it.readText()) }
+        val uploaded=call("/documents","POST",mapOf("uploadId" to "c".repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic parser output source\n%%EOF".toByteArray()),
+            "metadata" to mapOf("category" to "Statement","documentDate" to parsed["toDate"],"label" to "Synthetic wrapped statement","instrumentName" to "Investment statement","issuer" to "BK Capital")),cookie)
+        assertEquals(200,uploaded.statusCode(),uploaded.body())
+        val document=data(uploaded).text("documentId")
+        fun rows(key: String)=parsed.records(key).map { it+mapOf("currency" to parsed["currency"],"broker" to parsed["broker"]) }
+        val input=mapOf("documentId" to document,"items" to rows("rows"),"movements" to rows("movements"))
+        repeat(2) {
+            val result=call("/statement-items","POST",input,cookie)
+            assertEquals(200,result.statusCode(),result.body())
+            assertEquals(7,data(result).records("rows").size)
+            assertEquals(3,data(result).records("rows").count { it.text("reconciliationStatus")=="evidence-only" })
+        }
+        assertEquals(7,db.queryForObject("SELECT count(*) FROM bond_statement_items WHERE owner_id=?",Int::class.java,owner))
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+        assertTrue(data(call("/equities",cookie=cookie)).records("holdings").isEmpty())
     }
 
 }

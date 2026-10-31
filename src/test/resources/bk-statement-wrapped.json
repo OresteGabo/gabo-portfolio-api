@@ -1,0 +1,78 @@
+{
+  "kind": "statement",
+  "parser": {
+    "institution": "BK Capital",
+    "documentType": "statement",
+    "format": "rwf-client-statement",
+    "version": 1
+  },
+  "broker": "BK Capital",
+  "currency": "RWF",
+  "fromDate": "2026-07-01",
+  "toDate": "2026-09-30",
+  "rows": [
+    {
+      "kind": "bond",
+      "rowNumber": 2,
+      "date": "2026-07-17",
+      "amount": 1500000,
+      "title": "July Bond Cost"
+    },
+    {
+      "kind": "equity",
+      "rowNumber": 5,
+      "date": "2026-07-22",
+      "amount": 18400,
+      "title": "IMR",
+      "ticker": "IMR",
+      "shares": 200,
+      "pricePerShare": 90,
+      "contractNote": "10000000001#01"
+    },
+    {
+      "kind": "bond",
+      "rowNumber": 6,
+      "date": "2026-08-17",
+      "amount": 2000000,
+      "title": "August Bond Cost"
+    },
+    {
+      "kind": "equity",
+      "rowNumber": 7,
+      "date": "2026-09-24",
+      "amount": 184000,
+      "title": "BOK",
+      "ticker": "BOK",
+      "shares": 300,
+      "pricePerShare": 600,
+      "contractNote": "10000000002#01"
+    }
+  ],
+  "movements": [
+    {
+      "kind": "cash-receipt",
+      "date": "2026-07-14",
+      "amount": 1511000,
+      "direction": "credit",
+      "rowNumber": 1,
+      "title": "Cash receipt"
+    },
+    {
+      "kind": "fee",
+      "date": "2026-07-17",
+      "amount": 5000,
+      "direction": "debit",
+      "rowNumber": 3,
+      "title": "Statement fee"
+    },
+    {
+      "kind": "fee",
+      "date": "2026-07-17",
+      "amount": 5900,
+      "direction": "debit",
+      "rowNumber": 4,
+      "title": "Statement fee"
+    }
+  ],
+  "usedOcr": false
+}

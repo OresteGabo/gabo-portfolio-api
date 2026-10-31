@@ -33,3 +33,7 @@ Use `./gradlew test bootJar` with Docker running. Compatibility fixtures in `src
 - **Scheduler:** recreate the daily quote job on the new host or scheduler; configure its bearer secret.
 
 The website adapter and production cutover are separate changes. Keep the existing API serving users until both clients pass staging checks. Avoid simultaneous independent writes to two databases during cutover. Take a final backup, freeze or redirect writes, migrate the final delta, then switch traffic with a rollback plan.
+
+### V9: independent public bond terms and reviewed statement purchases
+
+Additive only: `bond_instruments`, seeded from the existing two public catalog definitions and existing shared issuance records; nullable purchase instrument/source-statement foreign keys and an instrument index. Exact security/settlement matches receive references; financial values and historical snapshots are unchanged. No private customer statements are migration fixtures. New statement creation atomically persists one purchase, original-source link and reconciliation decision, reusing current account locking and uniqueness constraints. Validate the backup and Flyway status before deployment. Application rollback can leave V9 in place; do not drop tables/columns containing new purchases' references. See API.md and companion KMP docs/RECONCILIATION.md for behavior and verification.

@@ -48,7 +48,7 @@ internal object StatementMatching {
 }
 
 @Service
-class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,private val portfolio: PortfolioService) {
+class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,private val portfolio: PortfolioService,private val instruments: BondInstrumentService,private val validation: PurchaseValidation) {
     private fun validate(raw: Record): Record {
         val error="Could not verify this BK Capital statement."
         val kinds=listOf("bond","equity","cash-receipt","fee","coupon","dividend","other")
@@ -80,7 +80,7 @@ class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,
         }
         return db.query("SELECT id::text,item FROM bond_statement_items WHERE owner_id=? ORDER BY created_at DESC LIMIT 500",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1))},owner)
     }
-    private fun decorate(owner: String,item: Record,purchases: List<Record>, evidence: Pair<Map<String,List<Record>>,Map<String,List<Record>>>): Record {
+    private fun decorate(owner: String,item: Record,purchases: List<Record>, evidence: Pair<Map<String,List<Record>>,Map<String,List<Record>>>,available: List<Record> = instruments.instruments()): Record {
         val decisions=evidence.second[item.text("id")].orEmpty()
         val latest=decisions.lastOrNull()
         val manual=latest?.takeIf { it.text("action")=="link" }?.let { decision-> purchases.firstOrNull { it.text("id")==decision.text("purchaseId") && StatementMatching.candidate(item,it) && StatementMatching.fingerprint(it)==decision.text("purchaseFingerprint") } }
@@ -98,7 +98,7 @@ class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,
             "matchMethod" to if(manual!=null)"manual" else if(status=="matched")"identity" else "none",
             "purchaseId" to (manual?.get("id") ?: strong.singleOrNull()?.get("id")?.takeIf { status=="matched" } ?: ""),
             "candidates" to candidates.map { it.filterKeys { key->key in listOf("id","bondName","securityName","ticker","isin","purchaseDate","settlementDate","tradeDate","faceValue","pricePercent","shares","netAmountPayable","currency","broker","instrumentType","confirmationDocumentId","contractDocumentId") } + mapOf("canLink" to StatementMatching.canConfirm(item,it)) },
-            "sources" to sources,"decisions" to decisions)
+            "sources" to sources,"decisions" to decisions,"bondOptions" to if(status=="unmatched" && sources.isNotEmpty())instruments.options(item,available) else emptyList<Record>())
     }
     private fun evidence(owner: String,items: List<Record>): Pair<Map<String,List<Record>>,Map<String,List<Record>>> {
         if(items.isEmpty())return emptyMap<String,List<Record>>() to emptyMap()
@@ -111,7 +111,8 @@ class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,
     fun records(owner: String,documentId: String?=null): List<Record> {
         val purchases=portfolio.bonds(owner)+portfolio.shares(owner)
         val items=rawItems(owner,documentId);val evidence=evidence(owner,items)
-        return items.map { decorate(owner,it,purchases,evidence) }
+        val available=instruments.instruments()
+        return items.map { decorate(owner,it,purchases,evidence,available) }
     }
     fun missing(owner: String)=records(owner).filter { it.text("reconciliationStatus") in listOf("unmatched","review-required") && it.text("kind") in listOf("bond","equity") }
     @Transactional fun reconcile(owner: String,raw: Record): List<Record> {
@@ -137,7 +138,43 @@ class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,
             item+mapOf("id" to id)
         }
         val evidence=evidence(owner,saved)
-        return saved.map { decorate(owner,it,purchases,evidence) }
+        val available=instruments.instruments()
+        return saved.map { decorate(owner,it,purchases,evidence,available) }
+    }
+    /** Explicit reviewed creation, never automatic inference from a month or statement debit. */
+    @Transactional fun createBond(owner: String,id: String,raw: Record): List<Record> {
+        lockAccount(db,owner);checkApi(uuid(id),"Invalid statement record.")
+        val row=records(owner).firstOrNull { it.text("id")==id } ?: throw ApiError(404,"Statement record not found.")
+        checkApi(row.text("kind")=="bond" && row.records("sources").isNotEmpty(),"Choose a saved bond statement entry.")
+        checkApi(raw["confirmed"]==true,"Confirm the bond and your actual purchase figures.")
+        val reason=raw.text("reason").trim();checkApi(reason.length in 3..500,"Explain this purchase confirmation.")
+        val instrument=instruments.options(row).singleOrNull { it.text("id")==raw.text("instrumentId") }
+            ?: throw ApiError(400,"Choose saved bond terms consistent with this statement date.")
+        val actual=listOf("faceValue","pricePercent","accruedInterestPaid","feesPaid","withholdingTaxRate")
+        checkApi(actual.all { raw[it] is Number },"Enter principal, executed price, accrued interest, fees and withholding tax explicitly.")
+        val input=instrument.filterKeys { it !in listOf("id","issuanceDate") }+raw.filterKeys { it in actual }+
+            mapOf("purchaseDate" to instrument.text("settlementDate"),"status" to "active","broker" to "BK Capital","notes" to "Purchase confirmed from statement; public bond terms reused.")
+        val proposed=validation.bond(input)
+        checkApi(actual.all { proposed.decimal(it).stripTrailingZeros().scale() <= if(it in listOf("pricePercent","withholdingTaxRate"))6 else 2 },"Use decimal money amounts with at most two fractional digits.")
+        checkApi((proposed.decimal("faceValue")*proposed.decimal("pricePercent")/java.math.BigDecimal(100)+proposed.decimal("accruedInterestPaid")-row.decimal("amount")).abs()<=java.math.BigDecimal("0.02"),
+            "Principal and execution figures must equal the statement bond cost; separately charged fees are additional.",409)
+        val prior=row.records("decisions").lastOrNull()
+        val purchases=portfolio.bonds(owner)
+        val existing=purchases.firstOrNull { it.text("id")==prior?.text("purchaseId") }
+        if(prior?.text("origin")=="statement-purchase" && existing!=null && prior.text("instrumentId")==instrument.text("id")) {
+            checkApi(StatementMatching.fingerprint(existing)==StatementMatching.fingerprint(proposed) && actual.all { existing.decimal(it).compareTo(proposed.decimal(it))==0 },"This statement entry already created a different purchase. Review its existing link.",409)
+            return listOf(row)
+        }
+        checkApi(row.text("reconciliationStatus")=="unmatched" && purchases.none {
+            StatementMatching.candidate(row,it) || normalized(it.text("isin"))==normalized(instrument.text("isin")) && it.text("settlementDate")==instrument.text("settlementDate")
+        },"An existing or pending purchase may describe this entry. Review and link it instead of creating another.",409)
+        checkApi(raw.text("expectedDecisionAt")==prior?.text("at").orEmpty(),"This reconciliation changed. Refresh before confirming.",409)
+        val purchase=portfolio.saveBond(owner,proposed)
+        db.update("UPDATE bond_purchases SET statement_document_id=?::uuid WHERE owner_id=? AND id=?::uuid",row.records("sources").first().text("documentId"),owner,purchase.text("id"))
+        val decision=mapOf("action" to "link","origin" to "statement-purchase","instrumentId" to instrument.text("id"),"purchaseId" to purchase.text("id"),"reason" to reason,
+            "actor" to owner,"at" to java.time.Instant.now().toString(),"purchaseFingerprint" to StatementMatching.fingerprint(purchase))
+        db.update("INSERT INTO bond_statement_decisions(owner_id,item_id,decision) VALUES (?,?::uuid,?::jsonb)",owner,id,json.write(decision))
+        return records(owner).filter { it.text("id")==id }
     }
     @Transactional fun resolve(owner: String,id: String,raw: Record): List<Record> {
         lockAccount(db,owner);checkApi(uuid(id),"Invalid statement record.")

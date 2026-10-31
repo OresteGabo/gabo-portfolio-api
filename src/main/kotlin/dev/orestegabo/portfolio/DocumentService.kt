@@ -6,7 +6,7 @@ import org.springframework.transaction.annotation.Transactional
 import java.util.Base64
 
 @Service
-class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,private val pending: PendingIssuanceService) {
+class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService) {
     fun documents(owner: String): List<Record> = db.query("SELECT COALESCE(legacy_id,id::text),metadata FROM bond_uploaded_documents WHERE owner_id=? ORDER BY created_at DESC",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}")},owner) + db.query("SELECT id::text,metadata FROM bond_issuance_documents ORDER BY created_at DESC",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}")})
     fun download(owner: String,id: String): Pair<ByteArray,String>? {
         if(!Regex("[a-zA-Z0-9_-]{1,160}").matches(id)) return null
@@ -45,6 +45,7 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
             val saved=db.queryForList("INSERT INTO bond_issuance_documents(issue_key,sha256,content,metadata) VALUES (?,?,?,?::jsonb) ON CONFLICT(issue_key) DO UPDATE SET issue_key=EXCLUDED.issue_key RETURNING id::text,metadata,(xmax<>0) AS duplicate",BondIssuance.key(issuance),hash,Base64.getEncoder().encodeToString(complete),json.write(metadata)).single()
             val prior=BondIssuance.validate(json.read(saved["metadata"].toString())["issuance"].record())
             checkApi(prior==issuance,"This bond issuance is already saved with different figures. Review the existing report.",409)
+            instruments.publish(saved.text("id"),issuance)
             db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND upload_id=?",owner,p["uploadId"])
             val updated=pending.refresh()
             return mapOf("documentId" to saved["id"],"duplicate" to saved["duplicate"],"updatedPendingPurchases" to updated)

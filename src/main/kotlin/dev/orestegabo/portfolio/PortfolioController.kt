@@ -38,6 +38,8 @@ class PortfolioController(private val portfolio: PortfolioService,private val do
     @GetMapping("/statement-items") fun missing(@RequestParam(required=false) documentId: String?,@RequestParam(defaultValue="false") all: Boolean)=mapOf("items" to if(documentId!=null || all)statements.records(currentAccount().id,documentId) else statements.missing(currentAccount().id))
     @PostMapping("/statement-items") fun statement(@RequestBody body: Record)=mapOf("rows" to statements.reconcile(currentAccount().id,body))
 
+    @PostMapping("/statement-items/{id}/bond") fun createStatementBond(@PathVariable id: String,@RequestBody body: Record)=mapOf("rows" to statements.createBond(currentAccount().id,id,body))
+
     @PostMapping("/statement-items/{id}/resolve") fun resolveStatement(@PathVariable id: String,@RequestBody body: Record)=mapOf("rows" to statements.resolve(currentAccount().id,id,body))
 
     private val reports=ConcurrentHashMap<String,Long>()

@@ -9,14 +9,14 @@ import java.time.ZoneOffset
 import java.math.BigDecimal
 
 @Service
-class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec, private val validation: PurchaseValidation,private val pending: PendingIssuanceService) {
+class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec, private val validation: PurchaseValidation,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService) {
     private val bondFields = listOf("instrumentType","issuer","currency","market","purchaseDate","settlementDate","bondName","isin","tenorYears","faceValue","pricePercent","accruedInterestPaid","feesPaid","amountInvested","couponRate","withholdingTaxRate","maturityDate","firstCouponDate","couponDates","couponFrequency","scheduleConfidence","broker","accountReference","sourceUrl","status","notes")
     private fun column(key: String) = key.replace(Regex("[A-Z]")) { "_${it.value.lowercase()}" }
     private val dates = setOf("purchaseDate","settlementDate","maturityDate","firstCouponDate")
     fun bonds(owner: String): List<Record> {
         pending.refresh(owner)
         return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
-            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString())
+            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
                 "couponDates" -> json.mapper.readValue(row[column(key)].toString(),List::class.java)
                 in dates -> row[column(key)]?.toString() ?: ""
@@ -37,6 +37,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         val values = bondFields.map { key -> when(key) { "couponDates" -> json.write(p[key]); in dates -> p.text(key).ifEmpty { null }; else -> p[key] } }
         if(id==null) db.update("INSERT INTO bond_purchases(id,owner_id,dedup_key,${bondFields.joinToString(",") { column(it) }},created_at) VALUES (?::uuid,?,?,${placeholders.joinToString(",")},?::timestamptz)",*(listOf(p["id"],owner,validation.bondKey(p))+values+p["createdAt"]).toTypedArray())
         else db.update("UPDATE bond_purchases SET dedup_key=?,${bondFields.zip(placeholders).joinToString(",") { (key,holder) -> "${column(key)}=$holder" }},updated_at=now() WHERE owner_id=? AND id=?::uuid",*(listOf(validation.bondKey(p))+values+listOf(owner,id)).toTypedArray())
+        db.update("UPDATE bond_purchases SET instrument_id=? WHERE owner_id=? AND id=?::uuid",instruments.reference(p),owner,p["id"])
         val proof=raw.text("confirmationDocumentId")
         if(proof.isNotBlank()) {
             checkApi(uuid(proof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",proof,owner).isNotEmpty(),"Confirmation PDF not found.")
