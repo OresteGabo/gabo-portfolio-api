@@ -8,7 +8,6 @@ import java.time.temporal.ChronoUnit
 @Service
 class BondInstrumentService(private val db: JdbcTemplate,private val json: JsonCodec) {
     fun instruments(): List<Record> = db.query("SELECT id,terms FROM bond_instruments ORDER BY settlement_date DESC,id",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1))})
-    fun find(id: String): Record? = instruments().firstOrNull { it.text("id")==id }
     private fun security(value: String)=normalized(value.uppercase().removeSuffix("/MN"))
     fun reference(p: Record): String? = instruments().singleOrNull {
         security(it.text("isin"))==security(p.text("isin")) && it.text("settlementDate")==p.text("settlementDate")

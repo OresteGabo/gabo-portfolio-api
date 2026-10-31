@@ -136,6 +136,18 @@ class LifecycleNotifications(private val db: JdbcTemplate,
         // Self-invocation bypasses @Transactional; give each account an actual rollback/lock boundary.
         for(owner in owners) runCatching { dailyTransactions.executeWithoutResult { sync(owner,today) } }
     }
+    /** Registrations are security activity, not proof of currently active sessions. */
+    fun signInActivity(owner: String,notificationId: String?): Record {
+        val highlight=notificationId?.let { id ->
+            checkApi(uuid(id),"Invalid security notification.")
+            val key=db.query("SELECT event_key FROM notifications WHERE owner_id=? AND id=?::uuid AND kind='security'",{r,_->r.getString(1)},owner,id).firstOrNull()
+                ?: throw ApiError(404,"Security notification not found.")
+            key.removePrefix("device:").takeIf { key.startsWith("device:") && uuid(it) } ?: ""
+        }.orEmpty()
+        val devices=db.query("SELECT device_id::text,platform,first_seen FROM account_devices WHERE owner_id=? ORDER BY (device_id::text=?) DESC,first_seen DESC,device_id LIMIT 100",
+            {r,_->mapOf("deviceId" to r.getString(1),"platform" to r.getString(2),"firstSeen" to r.getTimestamp(3).toInstant().toString())},owner,highlight)
+        return mapOf("devices" to devices,"highlightDeviceId" to highlight)
+    }
     @Transactional fun signIn(owner: String,device: String,platform: String) {
         if(!uuid(device) || platform !in listOf("ios","android"))return
         lockAccount(db,owner)
@@ -155,6 +167,7 @@ class LifecycleNotifications(private val db: JdbcTemplate,
 @RequestMapping("/api/bonds/notifications")
 class LifecycleNotificationController(private val lifecycle: LifecycleNotifications,private val pushes: PricePushSender) {
     @PostMapping("/session-device") fun device(@RequestBody p: Record): Record { lifecycle.signIn(currentAccount().id,p.text("deviceId"),p.text("platform"));runCatching { pushes.deliver() };return mapOf("saved" to true) }
+    @GetMapping("/sign-in-activity") fun signInActivity(@RequestParam(required=false) notificationId: String?)=lifecycle.signInActivity(currentAccount().id,notificationId)
     @GetMapping("/preferences") fun preferences()=lifecycle.preferences(currentAccount().id)
     @PutMapping("/preferences") fun update(@RequestBody body: Record)=lifecycle.update(currentAccount().id,body)
     @GetMapping("/coupons") fun coupons()=mapOf("receipts" to lifecycle.receipts(currentAccount().id))

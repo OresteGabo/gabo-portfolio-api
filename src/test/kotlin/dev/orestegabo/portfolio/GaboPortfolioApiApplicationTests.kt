@@ -646,4 +646,44 @@ class GaboPortfolioApiApplicationTests {
         assertTrue(data(call("/equities",cookie=cookie)).records("holdings").isEmpty())
     }
 
+    @Test fun `a different applied amount and optional ISIN suffix cannot bypass pending purchase duplicate protection`() {
+        val (_,cookie)=user()
+        val document=data(call("/documents","POST",mapOf("uploadId" to "d".repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic pending duplicate source\n%%EOF".toByteArray()),
+            "metadata" to mapOf("category" to "Statement","documentDate" to "2026-09-30","label" to "Synthetic","instrumentName" to "Investment statement","issuer" to "BK Capital")),cookie)).text("documentId")
+        val item=mapOf("kind" to "bond","date" to "2026-07-17","amount" to 1500000,"title" to "July Bond Cost","currency" to "RWF","broker" to "BK Capital","rowNumber" to 1)
+        val row=data(call("/statement-items","POST",mapOf("documentId" to document,"items" to listOf(item)),cookie)).records("rows").single()
+        val instrument=row.records("bondOptions").single()
+        val pending=instrument+mapOf("purchaseDate" to instrument.text("settlementDate"),"status" to "submitted","broker" to "BK Capital",
+            "isin" to instrument.text("isin").removeSuffix("/MN"),"faceValue" to 1600000,"accruedInterestPaid" to 0,"feesPaid" to 0,"withholdingTaxRate" to .05)
+        val saved=call("/purchases","POST",pending,cookie);assertEquals(201,saved.statusCode(),saved.body())
+        val body=mapOf("instrumentId" to instrument["id"],"faceValue" to 1500000,"pricePercent" to 100,"accruedInterestPaid" to 0,"feesPaid" to 10900,
+            "withholdingTaxRate" to .05,"confirmed" to true,"reason" to "Verified allocation differs from application","expectedDecisionAt" to "")
+        assertEquals(409,call("/statement-items/${row.text("id")}/bond","POST",body,cookie).statusCode())
+        val purchaseId=data(saved)["purchase"].record().text("id")
+        assertEquals(200,call("/purchases/$purchaseId","PUT",pending+mapOf("isin" to ""),cookie).statusCode())
+        assertEquals(409,call("/statement-items/${row.text("id")}/bond","POST",body,cookie).statusCode())
+        val purchases=data(call("/purchases",cookie=cookie)).records("purchases")
+        assertEquals(1,purchases.size);assertEquals("submitted",purchases.single()["status"])
+    }
+
+    @Test fun `security activity links the exact notification device and is isolated per account`() {
+        val (owner,a)=user();val (_,b)=user()
+        val first=newId();val second=newId()
+        lifecycle.signIn(owner,first,"ios");lifecycle.signIn(owner,second,"android")
+        val notification=data(call("/notifications",cookie=a)).records("notifications").single { it.text("kind")=="security" }
+        val id=notification.text("id")
+        val third=newId();lifecycle.signIn(owner,third,"ios")
+        val response=call("/notifications/sign-in-activity?notificationId=$id",cookie=a)
+        assertEquals(200,response.statusCode(),response.body())
+        val activity=data(response);assertEquals(second,activity["highlightDeviceId"])
+        assertEquals(setOf(first,second,third),activity.records("devices").map { it.text("deviceId") }.toSet())
+        assertEquals(second,activity.records("devices").first().text("deviceId"))
+        assertTrue(activity.records("devices").all { it.keys==setOf("deviceId","platform","firstSeen") })
+        assertEquals(404,call("/notifications/sign-in-activity?notificationId=$id",cookie=b).statusCode())
+        assertTrue(data(call("/notifications/sign-in-activity",cookie=b)).records("devices").isEmpty())
+        assertEquals(400,call("/notifications/sign-in-activity?notificationId=invalid",cookie=a).statusCode())
+        assertEquals(401,call("/notifications/sign-in-activity").statusCode())
+    }
+
 }

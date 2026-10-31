@@ -166,7 +166,10 @@ class StatementService(private val db: JdbcTemplate,private val json: JsonCodec,
             return listOf(row)
         }
         checkApi(row.text("reconciliationStatus")=="unmatched" && purchases.none {
-            StatementMatching.candidate(row,it) || normalized(it.text("isin"))==normalized(instrument.text("isin")) && it.text("settlementDate")==instrument.text("settlementDate")
+            val sameSecurity=it.text("isin").isNotBlank() && normalized(it.text("isin").uppercase().removeSuffix("/MN"))==normalized(instrument.text("isin").uppercase().removeSuffix("/MN"))
+            val sameUnidentifiedIssue=it.text("isin").isBlank() && (normalized(it.text("bondName"))==normalized(instrument.text("bondName")) ||
+                it.decimal("tenorYears").compareTo(instrument.decimal("tenorYears"))==0 && it.text("maturityDate")==instrument.text("maturityDate"))
+            StatementMatching.candidate(row,it) || (sameSecurity || sameUnidentifiedIssue) && it.text("settlementDate")==instrument.text("settlementDate")
         },"An existing or pending purchase may describe this entry. Review and link it instead of creating another.",409)
         checkApi(raw.text("expectedDecisionAt")==prior?.text("at").orEmpty(),"This reconciliation changed. Refresh before confirming.",409)
         val purchase=portfolio.saveBond(owner,proposed)
