@@ -9,14 +9,14 @@ import java.time.ZoneOffset
 import java.math.BigDecimal
 
 @Service
-class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec, private val validation: PurchaseValidation,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService) {
+class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec, private val validation: PurchaseValidation,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService,private val documents: DocumentService) {
     private val bondFields = listOf("instrumentType","issuer","currency","market","purchaseDate","settlementDate","bondName","isin","tenorYears","faceValue","pricePercent","accruedInterestPaid","feesPaid","amountInvested","couponRate","withholdingTaxRate","maturityDate","firstCouponDate","couponDates","couponFrequency","scheduleConfidence","broker","accountReference","sourceUrl","status","notes")
     private fun column(key: String) = key.replace(Regex("[A-Z]")) { "_${it.value.lowercase()}" }
     private val dates = setOf("purchaseDate","settlementDate","maturityDate","firstCouponDate")
     fun bonds(owner: String): List<Record> {
         pending.refresh(owner)
         val publicEvidence = db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it.text("id") to json.read(it["metadata"].toString())["issuance"].record() }
-        return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
+        return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata,COALESCE(c.legacy_id,c.id::text,p.confirmation_document_id::text) AS confirmation_reference FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id LEFT JOIN bond_uploaded_documents c ON c.id=p.confirmation_document_id AND c.owner_id=p.owner_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
             val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
                 "couponDates" -> json.mapper.readValue(row[column(key)].toString(),List::class.java)
@@ -29,7 +29,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 normalized(issue.text("isin")).removeSuffix("/mn")==normalized(result.text("isin")).removeSuffix("/mn") && result.text("isin").isNotBlank() &&
                     issue.text("settlementDate")==result.text("settlementDate") && issue.text("maturityDate")==result.text("maturityDate")
             }.singleOrNull()?.first
-            pending.decorate(if(row["issuance_document_id"]==null)validation.canonical(result) else result,publicId,row["confirmation_method"],row["confirmation_document_id"],row["issuance_metadata"]?.toString()?.let { json.read(it)["issuance"].record() }.orEmpty())
+            pending.decorate(if(row["issuance_document_id"]==null)validation.canonical(result) else result,publicId,row["confirmation_method"],row["confirmation_reference"],row["issuance_metadata"]?.toString()?.let { json.read(it)["issuance"].record() }.orEmpty())
         }
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
@@ -38,14 +38,16 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         lockAccount(db,owner)
         val purchase = validation.bond(raw)
         val incomingProof=raw.text("confirmationDocumentId")
+        val canonicalProof=if(incomingProof.isBlank())null else (documents.ownedEvidenceId(owner,incomingProof,"Bond confirmation")
+            ?: throw ApiError(400,"Confirmation PDF not found."))
         if(id==null && incomingProof.isNotBlank()) {
             val prior=db.queryForList("SELECT id::text FROM bond_purchases WHERE owner_id=? AND dedup_key=?",owner,validation.bondKey(purchase)).singleOrNull()
             if(prior!=null) {
                 val existing=bond(owner,prior.text("id"))!!
                 checkApi(existing.text("status")!="submitted" && sameFinancialRecord(validation.bond(existing),purchase),"The saved purchase differs from this PDF. Review it before attaching evidence.",409)
-                checkApi(uuid(incomingProof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",incomingProof,owner).isNotEmpty(),"Confirmation PDF not found.")
-                checkApi(existing.text("confirmationDocumentId").isBlank() || existing.text("confirmationDocumentId")==incomingProof,"This purchase already has another confirmation PDF.",409)
-                db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",incomingProof,owner,prior["id"])
+                val priorProof=existing.text("confirmationDocumentId")
+                checkApi(priorProof.isBlank() || documents.ownedEvidenceId(owner,priorProof,"Bond confirmation")==canonicalProof,"This purchase already has another confirmation PDF.",409)
+                db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",canonicalProof,owner,prior["id"])
                 instruments.contributePrivateCouponTerms(purchase)
                 return bond(owner,prior.text("id"))!!
             }
@@ -59,8 +61,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         db.update("UPDATE bond_purchases SET instrument_id=? WHERE owner_id=? AND id=?::uuid",instruments.reference(p),owner,p["id"])
         val proof=raw.text("confirmationDocumentId")
         if(proof.isNotBlank()) {
-            checkApi(uuid(proof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",proof,owner).isNotEmpty(),"Confirmation PDF not found.")
-            db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid WHERE id=?::uuid",proof,p["id"])
+            db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid WHERE id=?::uuid",canonicalProof,p["id"])
             instruments.contributePrivateCouponTerms(p)
         }
         pending.refresh(owner)

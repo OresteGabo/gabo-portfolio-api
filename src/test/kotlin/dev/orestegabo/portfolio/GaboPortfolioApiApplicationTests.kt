@@ -591,6 +591,37 @@ class GaboPortfolioApiApplicationTests {
     }
 
 
+    @Test fun `a retained legacy bond result can confirm restore and deduplicate without another upload`() {
+        val (_,a)=user();val (_,b)=user()
+        val canonical=data(upload(a)).text("documentId")
+        val alias="legacy-bond-result"
+        db.update("UPDATE bond_uploaded_documents SET legacy_id=?,metadata=jsonb_set(metadata,'{category}','\"Bond result\"') WHERE id=?::uuid",alias,canonical)
+        assertEquals(alias,data(call("/documents",cookie=a)).records("documents").single()["id"])
+        assertEquals(200,call("/documents/$alias",cookie=a).statusCode())
+        val input=bond("active")+mapOf("confirmationDocumentId" to alias)
+        val first=call("/purchases","POST",input,a)
+        assertEquals(201,first.statusCode(),first.body())
+        val firstPurchase=data(first)["purchase"].record()
+        assertEquals(alias,firstPurchase["confirmationDocumentId"])
+        val repeated=call("/purchases","POST",input,a);assertEquals(201,repeated.statusCode(),repeated.body())
+        assertEquals(firstPurchase["id"],data(repeated)["purchase"].record()["id"])
+        assertEquals(200,call("/purchases/${firstPurchase.text("id")}","DELETE",cookie=a).statusCode())
+        val restored=call("/purchases","POST",input,a);assertEquals(201,restored.statusCode(),restored.body())
+        assertNotEquals(firstPurchase["id"],data(restored)["purchase"].record()["id"])
+        assertEquals(1,data(call("/purchases",cookie=a)).records("purchases").size)
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(400,call("/purchases","POST",input,b).statusCode())
+        assertTrue(data(call("/purchases",cookie=b)).records("purchases").isEmpty())
+        val byCanonical=call("/purchases","POST",input+mapOf("confirmationDocumentId" to canonical),a)
+        assertEquals(201,byCanonical.statusCode(),byCanonical.body())
+        assertEquals(data(restored)["purchase"].record()["id"],data(byCanonical)["purchase"].record()["id"])
+        db.update("UPDATE bond_uploaded_documents SET legacy_id=NULL WHERE id=?::uuid",canonical)
+        assertEquals(400,call("/purchases","POST",input+mapOf("confirmationDocumentId" to canonical),a).statusCode()) // Old category requires a migrated legacy row.
+        db.update("UPDATE bond_uploaded_documents SET legacy_id=?,metadata=jsonb_set(metadata,'{category}',?::jsonb) WHERE id=?::uuid",alias,json.write("Portfolio statement"),canonical)
+        assertEquals(400,call("/purchases","POST",input,a).statusCode()) // An owned statement is not personal allocation proof.
+        assertEquals(1,data(call("/purchases",cookie=a)).records("purchases").size)
+    }
+
     @Test fun `a deleted bond can be recreated from its retained owned PDF without storing another file`() {
         val (_,cookie)=user();val proof=data(upload(cookie)).text("documentId")
         val input=bond("active")+mapOf("confirmationDocumentId" to proof)

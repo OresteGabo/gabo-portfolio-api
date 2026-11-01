@@ -12,6 +12,15 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
         if(!Regex("[a-zA-Z0-9_-]{1,160}").matches(id)) return null
         return db.query("SELECT content,metadata FROM bond_uploaded_documents WHERE owner_id=? AND (id::text=? OR legacy_id=?)",{r,_->Base64.getDecoder().decode(r.getString(1)) to json.read(r.getString(2)).text("originalFileName","document.pdf")},owner,id,id).firstOrNull() ?: db.query("SELECT content FROM bond_issuance_documents WHERE id::text=?",{r,_->Base64.getDecoder().decode(r.getString(1)) to "bond-issuance.pdf"},id).firstOrNull()
     }
+    /** Public API aliases are not database UUIDs. Resolve only within the authenticated owner's files. */
+    fun ownedEvidenceId(owner: String,reference: String,category: String): String? {
+        if(!Regex("[a-zA-Z0-9_-]{1,160}").matches(reference))return null
+        val legacyCategory=when(category) { "Bond confirmation" -> "Bond result"; "Share contract" -> "Equity contract"; else -> return null }
+        return db.queryForList("""SELECT id::text FROM bond_uploaded_documents
+            WHERE owner_id=? AND (id::text=? OR legacy_id=?)
+            AND (metadata->>'category'=? OR legacy_id IS NOT NULL AND metadata->>'category'=?)""",
+            owner,reference,reference,category,legacyCategory).singleOrNull()?.text("id")
+    }
     @Transactional fun upload(owner: String,p: Record): Record {
         lockAccount(db,owner)
         val error="Invalid PDF upload. Choose a PDF of up to 10 MB."

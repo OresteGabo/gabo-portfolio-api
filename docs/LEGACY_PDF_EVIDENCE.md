@@ -26,3 +26,11 @@ Current mobile code submits the existing save request when legacy equity data ha
 56 backend tests and bootJar passed using a freshly created disposable loopback PostgreSQL cluster. Added integration checks cover repeated evidence attachment to old bonds/shares, original IDs/counts/timestamps, mismatched financial details, cross-account denial and public issuance evidence without personal confirmation. No production data or real financial documents were used.
 
 Deploy this backend before distributing the updated KMP build. Otherwise the old duplicate constraints can reject the evidence-only save. No schema migration is required. No deployment performed in this task. Companion KMP documentation: `docs/TESTER_FEEDBACK_2026_11_01.md` and `docs/VERIFICATION.md`.
+
+## Migrated bond result aliases — 1 November 2026 follow-up
+
+Private migrated files can have stable text IDs and the old `Bond result` category. Previously they were downloadable but rejected when `confirmationDocumentId` was attached, because saving required both UUID syntax and `Bond confirmation`. The app masked the resulting `Confirmation PDF not found` response as a generic validation error.
+
+`DocumentService.ownedEvidenceId` now resolves UUID/legacy alias using the authenticated owner and expected evidence category. The old category is accepted only when `legacy_id` is present. Bond foreign keys store the canonical UUID; purchase DTOs expose the matching stable document alias. Duplicate checks compare canonical references, so using the UUID or alias for the same file does not falsely report a different confirmation. An owned statement, shared public report, another account's file or a fresh row with an unsupported legacy category remains ineligible.
+
+The failing-before regression now passes for confirmation, repeat, purchase deletion/restoration, UUID/alias equivalence and ownership/category denial, with one PDF and one resulting holding. All 63 backend tests and bootJar pass on disposable PostgreSQL. No new migration or file/category/financial-data rewrite is required. Deploy this patch; rebuilding the app alone does not change the server's acceptance of legacy references.
