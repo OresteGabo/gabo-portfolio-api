@@ -550,6 +550,42 @@ class GaboPortfolioApiApplicationTests {
     }
 
 
+    @Test fun `legacy investments gain owned evidence without duplicates or financial changes`() {
+        val (_,a)=user(); val (_,b)=user()
+        val original=data(call("/purchases","POST",bond("active"),a))["purchase"].record()
+        val publicId=db.queryForObject("INSERT INTO bond_issuance_documents(issue_key,sha256,content,metadata) VALUES ('synthetic-legacy-auction',repeat('a',64),'JVBERi0=',?::jsonb) RETURNING id::text",String::class.java,
+            json.write(mapOf("issuance" to mapOf("isin" to "RWTEST123456","settlementDate" to "2026-10-23","maturityDate" to "2031-10-23","couponRate" to .12))))
+        val withPublicEvidence=data(call("/purchases",cookie=a)).records("purchases").single()
+        assertEquals(publicId,withPublicEvidence["issuanceDocumentId"])
+        assertTrue(withPublicEvidence.text("confirmationDocumentId").isBlank())
+        assertEquals(original["faceValue"],withPublicEvidence["faceValue"])
+        val proof=data(upload(a)).text("documentId")
+        repeat(2) {
+            val linked=call("/purchases","POST",bond("active")+mapOf("confirmationDocumentId" to proof),a)
+            assertEquals(201,linked.statusCode(),linked.body())
+            assertEquals(original["id"],data(linked)["purchase"].record()["id"])
+        }
+        assertEquals(1,data(call("/purchases",cookie=a)).records("purchases").size)
+        assertEquals(409,call("/purchases","POST",bond("active")+mapOf("confirmationDocumentId" to proof,"feesPaid" to 12000),a).statusCode())
+        assertEquals(400,call("/purchases","POST",bond("active")+mapOf("confirmationDocumentId" to proof),b).statusCode())
+        val oldShare=data(call("/equities","POST",equity(),a))["holding"].record()
+        val source=call("/documents","POST",mapOf("uploadId" to "c".repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic legacy contract\n%%EOF".toByteArray()),
+            "metadata" to mapOf("category" to "Share contract","documentDate" to "2026-09-24","label" to "Legacy contract","instrumentName" to "Synthetic security","issuer" to "BK Capital")),a)
+        assertEquals(200,source.statusCode(),source.body())
+        val contract=data(source).text("documentId")
+        repeat(2) {
+            val linked=call("/equities","POST",equity()+mapOf("contractDocumentId" to contract),a)
+            assertEquals(201,linked.statusCode(),linked.body())
+            val saved=data(linked)["holding"].record()
+            assertEquals(oldShare["id"],saved["id"]); assertEquals(contract,saved["contractDocumentId"])
+            assertEquals(oldShare["createdAt"],saved["createdAt"])
+        }
+        assertEquals(1,data(call("/equities",cookie=a)).records("holdings").size)
+        assertEquals(409,call("/equities","POST",equity()+mapOf("contractDocumentId" to contract,"broker" to "Other broker"),a).statusCode())
+        assertEquals(400,call("/equities","POST",equity()+mapOf("contractDocumentId" to contract),b).statusCode())
+    }
+
     @Test fun `equity imports preserve their private contract PDF and reject another account source`() {
         val (_,a)=user();val (_,b)=user()
         val source=call("/documents","POST",mapOf("uploadId" to "a".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic share contract\n%%EOF".toByteArray()),

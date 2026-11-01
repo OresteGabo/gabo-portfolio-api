@@ -15,6 +15,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     private val dates = setOf("purchaseDate","settlementDate","maturityDate","firstCouponDate")
     fun bonds(owner: String): List<Record> {
         pending.refresh(owner)
+        val publicEvidence = db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it.text("id") to json.read(it["metadata"].toString())["issuance"].record() }
         return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
             val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
@@ -23,7 +24,12 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 "currency" -> row[column(key)].toString().trim()
                 else -> row[column(key)]
             }
-            pending.decorate(if(row["issuance_document_id"]==null)validation.canonical(result) else result,row["issuance_document_id"],row["confirmation_method"],row["confirmation_document_id"],row["issuance_metadata"]?.toString()?.let { json.read(it)["issuance"].record() }.orEmpty())
+            // Public auction evidence can be linked to an old holding without implying personal allocation proof.
+            val publicId = row["issuance_document_id"] ?: publicEvidence.filter { (_,issue) ->
+                normalized(issue.text("isin")).removeSuffix("/mn")==normalized(result.text("isin")).removeSuffix("/mn") && result.text("isin").isNotBlank() &&
+                    issue.text("settlementDate")==result.text("settlementDate") && issue.text("maturityDate")==result.text("maturityDate")
+            }.singleOrNull()?.first
+            pending.decorate(if(row["issuance_document_id"]==null)validation.canonical(result) else result,publicId,row["confirmation_method"],row["confirmation_document_id"],row["issuance_metadata"]?.toString()?.let { json.read(it)["issuance"].record() }.orEmpty())
         }
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
@@ -31,6 +37,18 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     @Transactional fun saveBond(owner: String, raw: Record, id: String? = null): Record {
         lockAccount(db,owner)
         val purchase = validation.bond(raw)
+        val incomingProof=raw.text("confirmationDocumentId")
+        if(id==null && incomingProof.isNotBlank()) {
+            val prior=db.queryForList("SELECT id::text FROM bond_purchases WHERE owner_id=? AND dedup_key=?",owner,validation.bondKey(purchase)).singleOrNull()
+            if(prior!=null) {
+                val existing=bond(owner,prior.text("id"))!!
+                checkApi(existing.text("status")!="submitted" && sameFinancialRecord(validation.bond(existing),purchase),"The saved purchase differs from this PDF. Review it before attaching evidence.",409)
+                checkApi(uuid(incomingProof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",incomingProof,owner).isNotEmpty(),"Confirmation PDF not found.")
+                checkApi(existing.text("confirmationDocumentId").isBlank() || existing.text("confirmationDocumentId")==incomingProof,"This purchase already has another confirmation PDF.",409)
+                db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",incomingProof,owner,prior["id"])
+                return bond(owner,prior.text("id"))!!
+            }
+        }
         val existing = id?.let { checkApi(uuid(it),"Invalid purchase id."); bond(owner,it) ?: throw ApiError(404,"Purchase not found.") }
         val p = purchase + mapOf("id" to (id ?: newId()),"createdAt" to (existing?.get("createdAt") ?: Instant.now().toString()))
         val placeholders = bondFields.map { when(it) { "couponDates" -> "?::jsonb"; in dates -> "?::date"; else -> "?" } }
@@ -65,9 +83,25 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         val documentId=raw.text("contractDocumentId").takeIf(String::isNotBlank)
         if(documentId!=null)checkApi(uuid(documentId) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE owner_id=? AND id=?::uuid AND metadata->>'category'='Share contract'",owner,documentId).isNotEmpty(),"Share contract PDF not found.")
         val p = validation.equity(raw)+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
+        if(documentId!=null) {
+            val candidates=shares(owner).filter { validation.equityKey(it)==validation.equityKey(p) }
+            checkApi(candidates.size<=1,"Multiple matching purchases require review.",409)
+            candidates.singleOrNull()?.let { existing ->
+                checkApi(sameFinancialRecord(validation.equity(existing),validation.equity(p)),"The saved purchase differs from this PDF. Review it before attaching evidence.",409)
+                checkApi(existing.text("contractDocumentId").isBlank() || existing.text("contractDocumentId")==documentId,"This purchase already has another contract PDF.",409)
+                val linked=existing+mapOf("contractDocumentId" to documentId)
+                db.update("UPDATE equity_purchases SET holding=?::jsonb WHERE owner_id=? AND id=?::uuid",json.write(linked),owner,existing["id"])
+                return linked
+            }
+        }
         val contract = p.text("contractNote").takeIf { it.isNotBlank() }?.let { "${normalized(p.text("broker"))}|${normalized(it)}" }
         db.update("INSERT INTO equity_purchases(id,owner_id,dedup_key,contract_key,report_key,holding) VALUES (?::uuid,?,?,?,?,?::jsonb)",p["id"],owner,validation.equityKey(p),contract,p.text("tradeReportId").ifBlank { null },json.write(p))
         return p
+    }
+    // Preserve optional notes/source fields; every normalized financial/identity field must agree.
+    private fun sameFinancialRecord(a: Record,b: Record): Boolean = (a.keys+b.keys).filterNot { it in setOf("notes","sourceUrl","accountReference") }.all { key ->
+        val x=a[key]; val y=b[key]
+        if(x is Number && y is Number) x.toString().toBigDecimal().compareTo(y.toString().toBigDecimal())==0 else x==y
     }
     fun accounts(owner: Account,friend: Account?): List<Record> {
         val accounts = mutableListOf<Record>(mapOf("id" to owner.id,"email" to owner.email,"createdAt" to null,"status" to "active","kind" to "owner","deletable" to false))
