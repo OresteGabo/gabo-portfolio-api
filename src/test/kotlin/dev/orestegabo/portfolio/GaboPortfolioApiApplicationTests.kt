@@ -591,6 +591,22 @@ class GaboPortfolioApiApplicationTests {
     }
 
 
+    @Test fun `a deleted bond can be recreated from its retained owned PDF without storing another file`() {
+        val (_,cookie)=user();val proof=data(upload(cookie)).text("documentId")
+        val input=bond("active")+mapOf("confirmationDocumentId" to proof)
+        val first=call("/purchases","POST",input,cookie);assertEquals(201,first.statusCode(),first.body())
+        val old=data(first)["purchase"].record().text("id")
+        assertEquals(200,call("/purchases/$old","DELETE",cookie=cookie).statusCode())
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+        assertEquals(200,call("/documents/$proof",cookie=cookie).statusCode())
+        val restored=call("/purchases","POST",input,cookie);assertEquals(201,restored.statusCode(),restored.body())
+        val id=data(restored)["purchase"].record().text("id");assertNotEquals(old,id)
+        val repeated=call("/purchases","POST",input,cookie);assertEquals(201,repeated.statusCode(),repeated.body())
+        assertEquals(id,data(repeated)["purchase"].record()["id"])
+        assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+    }
+
     @Test fun `legacy investments gain owned evidence without duplicates or financial changes`() {
         val (_,a)=user(); val (_,b)=user()
         val original=data(call("/purchases","POST",bond("active"),a))["purchase"].record()
