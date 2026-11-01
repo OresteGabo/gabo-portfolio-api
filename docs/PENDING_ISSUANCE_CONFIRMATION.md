@@ -26,3 +26,9 @@ BNR public reports can contain passive digital-signature widgets. iOS checks PDF
 Reports can be chosen from Documents, Add purchase or a pending bond's upload action. A public report always opens the shared issuance review, never the personal-allocation review. Matching pending purchases stay pending. Later personal PDFs can reuse missing public coupon/tenor/maturity details from a unique shared report with the same security code and settlement date. The personal PDF must still supply the allocation and executed price; read values are never overwritten with auction totals.
 
 Multipart uploads compare metadata using PostgreSQL JSONB equality, so equivalent number formats do not cause a false resume conflict. A genuinely changed label, terms or part count is still rejected. Regression tests cover the original signed PDF locally, both extraction layouts, two-part storage/download, shared access across accounts, and duplicate uploads.
+
+## Beta public contributions and notifications — 1 November 2026
+
+The founder selected immediate sharing by any authenticated beta user who explicitly declares the report public. This supersedes the earlier owner-only gate. Format/term validation and duplicate/conflict checks remain; independent BNR authenticity verification and staff approval are deferred. Private personal evidence remains owner scoped.
+
+Publication now links public evidence to compatible confirmed historical holdings without rewriting their terms; pending enrichment still preserves amounts/status. Each affected account gets one preference-aware event per purchase/report, with exact purchase or shared-PDF navigation. The existing push queue is used; device delivery/realtime UI refresh is not guaranteed. Canonical retries preserve the first PDF, terms and internal first-publisher attribution. See API.md and companion `docs/SHARED_DOCUMENTS.md`.

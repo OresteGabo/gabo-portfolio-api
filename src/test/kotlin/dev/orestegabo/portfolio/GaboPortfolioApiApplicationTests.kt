@@ -174,7 +174,7 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(400,call("/rse/equity-history?tickers=bad").statusCode())
     }
 
-    @Test fun `only the owner can publish shared issuance and change other accounts pending terms`() {
+    @Test fun `contributions without explicit public intent cannot change other accounts pending terms`() {
         val owner=login();val (_,other)=user()
         val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
         val pending=bond()+mapOf("isin" to "","tenorYears" to 20,"maturityDate" to issue["maturityDate"],"couponRate" to 0,"firstCouponDate" to "","couponDates" to emptyList<String>())
@@ -182,7 +182,7 @@ class GaboPortfolioApiApplicationTests {
         val result=call("/documents","POST",mapOf("uploadId" to "e".repeat(32),"index" to 0,"count" to 1,
             "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic untrusted publication\n%%EOF".toByteArray()),
             "metadata" to mapOf("category" to "Bond issuance","label" to "Untrusted publication","instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"documentDate" to issue["issuanceDate"],"issuance" to issue)),other)
-        assertEquals(403,result.statusCode(),result.body())
+        assertEquals(400,result.statusCode(),result.body())
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
         assertEquals(0.0,data(call("/purchases/${purchase.text("id")}",cookie=owner))["purchase"].record().number("couponRate"))
@@ -431,7 +431,7 @@ class GaboPortfolioApiApplicationTests {
     }
 
     @Test fun `two part public report saves its PDF and enriches all accounts only after completion`() {
-        val owner=login();val (_,other)=user()
+        val owner=login();val (_,other)=user();val (_,contributor)=user()
         val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
         val pending=bond()+mapOf("bondName" to "October 20-year bond","isin" to "","tenorYears" to 20,"maturityDate" to issue["maturityDate"],"couponRate" to 0,"firstCouponDate" to "","couponDates" to emptyList<String>())
         val a=data(call("/purchases","POST",pending,owner))["purchase"].record()
@@ -440,13 +440,18 @@ class GaboPortfolioApiApplicationTests {
         val bytes=System.getenv("GABO_TEST_ISSUANCE_PDF")?.let { java.nio.file.Files.readAllBytes(java.nio.file.Path.of(it)) }
             ?: ByteArray(538039) { 32 }.also { "%PDF-1.7\n".toByteArray().copyInto(it);"\n%%EOF".toByteArray().copyInto(it,it.size-6) }
         assertTrue(bytes.size>512*1024 && bytes.size<=1024*1024)
-        val metadata=mapOf("label" to "Bond issuance results","category" to "Bond issuance","documentDate" to issue["issuanceDate"],"instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"issuance" to issue)
-        fun part(index: Int,uploadId: String="b".repeat(32),cookie: String=owner,details: Record=metadata)=call("/documents","POST",mapOf("uploadId" to uploadId,"index" to index,"count" to 2,
+        val metadata=mapOf("visibility" to "shared","label" to "Bond issuance results","category" to "Bond issuance","documentDate" to issue["issuanceDate"],"instrumentName" to issue["bondName"],"issuer" to issue["issuer"],"issuance" to issue)
+        fun part(index: Int,uploadId: String="b".repeat(32),cookie: String=contributor,details: Record=metadata)=call("/documents","POST",mapOf("uploadId" to uploadId,"index" to index,"count" to 2,
             "content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(index*512*1024,minOf(bytes.size,(index+1)*512*1024))),"metadata" to details),cookie)
         val first=part(0);assertEquals(200,first.statusCode(),first.body());assertFalse(data(first).containsKey("documentId"))
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
         assertEquals(409,part(1,details=metadata+mapOf("label" to "Changed during upload")).statusCode())
         val complete=part(1);assertEquals(200,complete.statusCode(),complete.body());assertEquals(2,data(complete)["updatedPendingPurchases"])
+        for((purchase,cookie) in listOf(a to owner,b to other)) {
+            val notice=data(call("/notifications",cookie=cookie)).records("notifications").single { it.text("stage")=="issuance" }
+            assertEquals(purchase["id"],notice["purchaseId"]);assertEquals("pending",notice["kind"])
+            assertEquals(data(complete)["documentId"],notice["documentId"])
+        }
         for((purchase,cookie) in listOf(a to owner,b to other)) {
             val saved=data(call("/purchases/${purchase.text("id")}",cookie=cookie))["purchase"].record()
             assertEquals("submitted",saved["status"]);assertEquals(.1315,saved.number("couponRate"));assertEquals(40,saved.strings("couponDates").size)
@@ -461,6 +466,42 @@ class GaboPortfolioApiApplicationTests {
         val duplicate=part(1,"c".repeat(32),owner);assertEquals(200,duplicate.statusCode(),duplicate.body());assertEquals(true,data(duplicate)["duplicate"])
         assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        for(cookie in listOf(owner,other)) assertEquals(1,data(call("/notifications",cookie=cookie)).records("notifications").count { it.text("stage")=="issuance" })
+    }
+
+    @Test fun `public contributions are globally reused while identical personal PDFs remain owner private`() {
+        val (_,a)=user();val (contributor,b)=user()
+        val one=data(upload(a)).text("documentId");val two=data(upload(b)).text("documentId")
+        assertNotEquals(one,two)
+        assertEquals(404,call("/documents/$one",cookie=b).statusCode())
+        assertEquals(404,call("/documents/$two",cookie=a).statusCode())
+        assertEquals("private",data(call("/documents",cookie=a)).records("documents").single()["visibility"])
+        val issue=json.read(javaClass.getResourceAsStream("/bnr-issuance.json")!!.bufferedReader().use { it.readText() })
+        val active=bond("active")+mapOf("bondName" to issue["bondName"],"isin" to issue["isin"],"tenorYears" to 20,
+            "maturityDate" to issue["maturityDate"],"couponRate" to .1315)
+        val original=data(call("/purchases","POST",active,a))["purchase"].record()
+        fun publish(cookie: String,terms: Record=issue)=call("/documents","POST",mapOf("uploadId" to "f".repeat(32),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public report\n%%EOF".toByteArray()),
+            "metadata" to mapOf("visibility" to "shared","category" to "Bond issuance","documentDate" to issue["issuanceDate"],"label" to "Public BNR report",
+                "instrumentName" to issue["bondName"],"issuer" to "Government of Rwanda","issuance" to terms)),cookie)
+        val published=publish(b);assertEquals(200,published.statusCode(),published.body())
+        val id=data(published).text("documentId")
+        val repeated=publish(a);assertEquals(200,repeated.statusCode(),repeated.body())
+        assertEquals(true,data(repeated)["duplicate"]);assertEquals(id,data(repeated)["documentId"])
+        val saved=data(call("/purchases",cookie=a)).records("purchases").single()
+        assertEquals(id,saved["issuanceDocumentId"]);assertEquals("active",saved["status"])
+        assertEquals(original["faceValue"],saved["faceValue"]);assertEquals(original["couponRate"],saved["couponRate"])
+        assertTrue(saved.text("confirmationDocumentId").isBlank())
+        val notice=data(call("/notifications",cookie=a)).records("notifications").single { it.text("stage")=="issuance" }
+        assertEquals("documents",notice["kind"]);assertEquals(id,notice["documentId"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(400,publish(b,issue+mapOf("faceValue" to 1200000)).statusCode())
+        assertEquals(409,publish(b,issue+mapOf("couponRate" to .15)).statusCode())
+        assertEquals(1,data(call("/notifications",cookie=a)).records("notifications").count { it.text("stage")=="issuance" })
+        val shared=data(call("/documents",cookie=b)).records("documents").single { it.text("id")==id }
+        assertEquals("shared",shared["visibility"]);assertFalse(shared.containsKey("_publishedBy"))
+        assertEquals(contributor,db.queryForObject("SELECT metadata->>'_publishedBy' FROM bond_issuance_documents WHERE id=?::uuid",String::class.java,id))
     }
 
     @Test fun `issuance uploads are shared idempotent and guarded against conflicting terms`() {
@@ -492,7 +533,7 @@ class GaboPortfolioApiApplicationTests {
         val (_,other)=user()
         assertEquals(2,data(call("/documents",cookie=other)).records("documents").size)
         val otherUpload=send('e',token=other)
-        assertEquals(403,otherUpload.statusCode(),otherUpload.body())
+        assertEquals(400,otherUpload.statusCode(),otherUpload.body()) // Explicit sharing consent is required for contributors.
         assertEquals(200,call("/documents/${data(a)["documentId"]}",cookie=other).statusCode())
         assertEquals(401,call("/documents/${data(a)["documentId"]}").statusCode())
         assertEquals(2,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))

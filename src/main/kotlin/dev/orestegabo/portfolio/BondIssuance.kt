@@ -5,6 +5,8 @@ object BondIssuance {
     fun key(p: Record) = "${p.text("isin")}|${p.text("settlementDate")}"
     fun validate(raw: Record): Record {
         val error="Some issuance details could not be verified. Choose a clearer BNR market results PDF."
+        checkApi(listOf("faceValue","accountReference","cdsAccountNo","investorName","clientName","netAmountPayable","contractNote").none(raw::containsKey),
+            "Personal allocation or account details cannot be published as a public issuance.")
         val p=linkedMapOf<String,Any?>()
         for(k in listOf("bondName","isin")) p[k]=raw.text(k).uppercase().replace(Regex("\\s"),"")
         checkApi(Regex("FXD[0-9]+/[0-9]{4}/[0-9]+YR").matches(p.text("bondName")) && Regex("RW[A-Z0-9]{8,30}/MN").matches(p.text("isin")),error)

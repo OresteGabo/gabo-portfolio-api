@@ -6,7 +6,7 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 
 @Service
-class PendingIssuanceService(private val db: JdbcTemplate,private val json: JsonCodec) {
+class PendingIssuanceService(private val db: JdbcTemplate,private val json: JsonCodec,private val notifications: PriceNotifications) {
     private fun issues()=db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it+mapOf("terms" to json.read(it["metadata"].toString())["issuance"].record()) }
     private fun matching(p: Record,issues: List<Record>): Record? {
         if(p.text("status")!="submitted" || p.text("currency")!="RWF" || p.text("issuer")!="Government of Rwanda" || p.text("market")!="primary")return null
@@ -31,10 +31,13 @@ class PendingIssuanceService(private val db: JdbcTemplate,private val json: Json
                 json.mapper.readValue(row["coupon_dates"].toString(),List::class.java)==terms.strings("couponDates") &&
                 row["maturity_date"].toString()==terms.text("maturityDate") && row["first_coupon_date"].toString()==terms.text("firstCouponDate") &&
                 (row["coupon_frequency"] as Number).toInt()==terms.number("couponFrequency").toInt() && row["schedule_confidence"]==terms["scheduleConfidence"])continue
-            changed+=db.update("""UPDATE bond_purchases SET coupon_rate=?,first_coupon_date=?::date,coupon_dates=?::jsonb,
+            val updated=db.update("""UPDATE bond_purchases SET coupon_rate=?,first_coupon_date=?::date,coupon_dates=?::jsonb,
                 coupon_frequency=?,schedule_confidence=?,maturity_date=?::date,issuance_document_id=?::uuid,updated_at=now()
                 WHERE id=?::uuid AND status='submitted'""",terms["couponRate"],terms["firstCouponDate"],json.write(terms["couponDates"]),
                 terms["couponFrequency"],terms["scheduleConfidence"],terms["maturityDate"],match["id"],row["id"].toString())
+            changed+=updated
+            if(updated>0) notifications.event(row.text("owner_id"),"pending","issuance:${match.text("id")}:${row["id"]}",notificationToday(),
+                mapOf("stage" to "issuance","purchaseId" to row["id"].toString(),"documentId" to match["id"],"title" to terms["bondName"],"action" to "purchase"))
         }
         return changed
     }

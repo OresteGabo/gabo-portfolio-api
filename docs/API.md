@@ -44,7 +44,7 @@ Equity imports require RSE/RWF, an ISIN/ticker, positive integer shares, consist
 
 ## Documents
 
-POST JSON: `{uploadId,index,count,content,metadata}`. `uploadId` is 32 lowercase hexadecimal characters, content is canonical base64, count is 1–20, chunks are 512 KiB except the last, maximum complete PDF is 10 MiB. Metadata has category `Bond confirmation`, `Share contract`, `Statement` or `Bond issuance` (owner publication only), a real `documentDate`, and string `label`, `instrumentName`, `issuer` (up to 240 characters each).
+POST JSON: `{uploadId,index,count,content,metadata}`. `uploadId` is 32 lowercase hexadecimal characters, content is canonical base64, count is 1–20, chunks are 512 KiB except the last, maximum complete PDF is 10 MiB. Metadata has category `Bond confirmation`, `Share contract`, `Statement` or `Bond issuance` (explicit public contribution during beta), a real `documentDate`, and string `label`, `instrumentName`, `issuer` (up to 240 characters each).
 
 Unfinished uploads are private, hidden from the library and limited to eight per account. Uploads older than one day are cleaned on a later upload by the same account; there is no independently scheduled purge. Completion validates a supported PDF header and end marker, in addition to the size/chunk limits. This is envelope validation, not malware or signature verification. Completed content is deduplicated by account and SHA-256. Responses contain `{}` while incomplete, then `{documentId}`. Resending a conflicting chunk or metadata is rejected.
 
@@ -62,7 +62,7 @@ Statement imports create missing-document reminders, not invented holdings or pr
 
 ## Security boundaries updated 30 October 2026
 
-Only the existing owner account may publish a `Bond issuance` PDF/canonical terms shared across accounts. Invited users can still read published reports and privately upload personal confirmations, share contracts and statements. Unprivileged publication is rejected before staging. Existing shared data requires operator provenance review; this permission change does not validate old reports.
+**Superseded 1 November 2026 by the founder-selected beta policy:** authenticated users may contribute a new public `Bond issuance` with `metadata.visibility="shared"`. The existing owner identity is retained for older owner-client compatibility; the new app requires explicit sharing consent for new public uploads. Personal confirmation/contracts/statements remain account private regardless of a supplied visibility flag. Public field validation is not independent PDF-content/issuer authenticity verification; wider registration requires a future approval/source-verification gate. Existing shared sources still need provenance review.
 
 `/rse/equity-history` keeps its response shape. Anonymous callers receive official observations with no private contract rows and `tradeHistoryAvailable=false`; authenticated users may receive their own derived contract prices. No user-supplied owner query/body parameter selects another account.
 
@@ -70,7 +70,7 @@ Scheduled per-account receipt/reminder work now has an explicit transaction boun
 
 ## Reviewed statement bond purchases (31 October 2026)
 
-Flyway V9 adds public `bond_instruments` (existing catalog/shared issuance terms, unique security + settlement) and optional purchase references `instrument_id` / private `statement_document_id`. Existing purchase fields, IDs, amounts and API contracts remain; old columns are retained as historical/compatibility snapshots. Publishing an owner-reviewed issuance registers its terms without silently replacing conflicting schedules. Purchase responses add `instrumentId` and `statementDocumentId`.
+Flyway V9 adds public `bond_instruments` (existing catalog/shared issuance terms, unique security + settlement) and optional purchase references `instrument_id` / private `statement_document_id`. Existing purchase fields, IDs, amounts and API contracts remain; old columns are retained as historical/compatibility snapshots. Publishing a beta-contributed public issuance registers its terms without silently replacing conflicting schedules. Purchase responses add `instrumentId` and `statementDocumentId`.
 
 Statement rows add `bondOptions` only for unmatched, privately sourced bond entries with compatible saved terms. Authenticated `POST /api/bonds/statement-items/{id}/bond` accepts `instrumentId`, explicit numeric `faceValue`, `pricePercent`, `accruedInterestPaid`, `feesPaid`, `withholdingTaxRate`, `confirmed: true`, `reason` and `expectedDecisionAt`. It uses the same owner scope, lock, transaction, purchase validation/uniqueness and append-only statement decisions. It returns `{rows:[updatedStatementRecord]}`. Public terms are server-selected; acquisition date is the selected primary settlement date and original posting date is preserved in statement evidence.
 
@@ -83,3 +83,13 @@ Deploy V9/backend before using this action. Existing clients continue operating;
 Authenticated GET `/api/bonds/notifications/sign-in-activity` reads existing `account_devices` registrations for the current account only. Optional `notificationId` must identify an owned security notification; the server resolves its existing `device:<uuid>` event key, so historical notifications need no payload migration. Returns `{devices:[{deviceId,platform,firstSeen}],highlightDeviceId}` with at most 100 entries, putting the selected device first even after newer registrations. These records describe first-observed sign-ins/installations, not currently active sessions, hardware attestation or last-seen state.
 
 Invalid notification IDs return 400, inaccessible/non-security alerts 404 and unauthenticated access 401. No caller-supplied owner, session token, IP, password or new device metadata is exposed. This is read-only; no schema change, new retention scheme, remote revocation or financial mutation. Integration regressions check exact older-alert targeting, allowlisted fields and cross-account denial. The mobile inbox now directs security events here, target events to the existing target editor and report events to existing report options; old `action=settings` payloads remain supported by category.
+
+## Shared publication, reuse and linkage — 1 November 2026
+
+Document list entries add server-selected `visibility: private|shared`. Shared publication stores internal `_publishedBy` attribution; document responses omit it. No new migration is required. Existing shared rows without attribution remain unchanged.
+
+A matching public security/settlement and identical normalized terms returns `{documentId,duplicate:true,updatedPendingPurchases}` even before the remaining chunks; clients should stop uploading when a document ID is returned. Different figures return 409. Incomplete new reports never publish. Private deduplication remains owner/hash scoped.
+
+Publication transactionally links compatible confirmed holdings' public evidence/instrument references without rewriting their financial values, enriches matching submitted applications across accounts while preserving submitted status/amounts, creates deduplicated own-account alerts and queues the existing push delivery system. Pending alert: `kind=pending,stage=issuance,purchaseId,documentId`. Historical evidence alert: `kind=documents,stage=issuance,documentId,purchaseId`. Neither contains another investor's amount or publisher identity. Device refresh/push delivery remains subject to the existing setup; no realtime guarantees.
+
+Public sources never confirm personal allocation. Full policy, explicit beta trust limitations and future staff-review gate: companion KMP `docs/SHARED_DOCUMENTS.md`.

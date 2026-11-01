@@ -6,8 +6,8 @@ import org.springframework.transaction.annotation.Transactional
 import java.util.Base64
 
 @Service
-class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService) {
-    fun documents(owner: String): List<Record> = db.query("SELECT COALESCE(legacy_id,id::text),metadata FROM bond_uploaded_documents WHERE owner_id=? ORDER BY created_at DESC",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}")},owner) + db.query("SELECT id::text,metadata FROM bond_issuance_documents ORDER BY created_at DESC",{r,_->json.read(r.getString(2))+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}")})
+class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,private val pending: PendingIssuanceService,private val instruments: BondInstrumentService,private val notifications: PriceNotifications) {
+    fun documents(owner: String): List<Record> = db.query("SELECT COALESCE(legacy_id,id::text),metadata FROM bond_uploaded_documents WHERE owner_id=? ORDER BY created_at DESC",{r,_->json.read(r.getString(2)).filterKeys { it!="_publishedBy" }+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}","visibility" to "private")},owner) + db.query("SELECT id::text,metadata FROM bond_issuance_documents ORDER BY created_at DESC",{r,_->json.read(r.getString(2)).filterKeys { it!="_publishedBy" }+mapOf("id" to r.getString(1),"downloadUrl" to "/api/bonds/documents/${r.getString(1)}","visibility" to "shared")})
     fun download(owner: String,id: String): Pair<ByteArray,String>? {
         if(!Regex("[a-zA-Z0-9_-]{1,160}").matches(id)) return null
         return db.query("SELECT content,metadata FROM bond_uploaded_documents WHERE owner_id=? AND (id::text=? OR legacy_id=?)",{r,_->Base64.getDecoder().decode(r.getString(1)) to json.read(r.getString(2)).text("originalFileName","document.pdf")},owner,id,id).firstOrNull() ?: db.query("SELECT content FROM bond_issuance_documents WHERE id::text=?",{r,_->Base64.getDecoder().decode(r.getString(1)) to "bond-issuance.pdf"},id).firstOrNull()
@@ -21,10 +21,22 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
         checkApi(bytes.isNotEmpty() && bytes.size<=512*1024 && Base64.getEncoder().encodeToString(bytes)==p.text("content") && (index==count-1 || bytes.size==512*1024) && (index!=0.0 || bytes.take(5).toByteArray().contentEquals("%PDF-".toByteArray())),error)
         val m=p["metadata"].record()
         checkApi(m.text("category") in listOf("Bond confirmation","Share contract","Bond issuance","Statement") && date(m.text("documentDate"))!=null && listOf("label","instrumentName","issuer").all { m[it] is String && m.text(it).length<=240 },error)
-        // Shared canonical terms update other accounts and must not trust an arbitrary authenticated uploader.
-        if(m.text("category")=="Bond issuance") checkApi(owner=="owner","Only the owner can publish shared issuance results.",403)
+        // Beta policy: authenticated users may contribute explicitly public issuance reports.
+        // Private categories never enter the shared table, regardless of supplied visibility.
+        if(m.text("category")=="Bond issuance") checkApi(owner=="owner" || m.text("visibility")=="shared","Confirm that this report is public before sharing it.",400)
         val issuance=if(m.text("category")=="Bond issuance") BondIssuance.validate(m["issuance"].record()) else null
-        val metadata=m.filterKeys { it in listOf("label","instrumentName","issuer","category","documentDate") }+mapOf("description" to "","originalFileName" to if(m.text("category")=="Bond confirmation") "bond-confirmation.pdf" else if(issuance!=null) "bond-issuance.pdf" else if(m.text("category")=="Statement") "broker-statement.pdf" else "share-contract.pdf") + (issuance?.let { mapOf("issuance" to it,"issuanceKey" to BondIssuance.key(it),"details" to BondIssuance.details(it)) } ?: emptyMap())
+        val metadata=m.filterKeys { it in listOf("label","instrumentName","issuer","category","documentDate") }+mapOf("description" to "","originalFileName" to if(m.text("category")=="Bond confirmation") "bond-confirmation.pdf" else if(issuance!=null) "bond-issuance.pdf" else if(m.text("category")=="Statement") "broker-statement.pdf" else "share-contract.pdf") + (issuance?.let { mapOf("issuance" to it,"issuanceKey" to BondIssuance.key(it),"details" to BondIssuance.details(it),"_publishedBy" to owner) } ?: emptyMap())
+        if(issuance!=null) {
+            val prior=db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents WHERE issue_key=?",BondIssuance.key(issuance)).singleOrNull()
+            if(prior!=null) {
+                checkApi(BondIssuance.validate(json.read(prior["metadata"].toString())["issuance"].record())==issuance,
+                    "This bond issuance is already saved with different figures. Review the existing report.",409)
+                instruments.publish(prior.text("id"),issuance)
+                val updated=pending.refresh(); notifications.queue()
+                db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND upload_id=?",owner,p["uploadId"])
+                return mapOf("documentId" to prior["id"],"duplicate" to true,"updatedPendingPurchases" to updated)
+            }
+        }
         db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND created_at<now()-interval '1 day'",owner)
         // JSONB compares equivalent numeric forms (e.g. 1E10 and 10000000000) across upload parts.
         val existing=db.queryForList("SELECT parts,part_count,metadata=?::jsonb AS same_metadata FROM bond_document_uploads WHERE owner_id=? AND upload_id=? FOR UPDATE",json.write(metadata),owner,p["uploadId"]).firstOrNull()
@@ -48,6 +60,7 @@ class DocumentService(private val db: JdbcTemplate,private val json: JsonCodec,p
             instruments.publish(saved.text("id"),issuance)
             db.update("DELETE FROM bond_document_uploads WHERE owner_id=? AND upload_id=?",owner,p["uploadId"])
             val updated=pending.refresh()
+            notifications.queue()
             return mapOf("documentId" to saved["id"],"duplicate" to saved["duplicate"],"updatedPendingPurchases" to updated)
         }
         val id=db.queryForObject("INSERT INTO bond_uploaded_documents(owner_id,sha256,content,metadata) VALUES (?,?,?,?::jsonb) ON CONFLICT(owner_id,sha256) DO UPDATE SET sha256=EXCLUDED.sha256 RETURNING id::text",String::class.java,owner,hash,Base64.getEncoder().encodeToString(complete),json.write(metadata))!!
