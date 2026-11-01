@@ -93,3 +93,7 @@ A matching public security/settlement and identical normalized terms returns `{d
 Publication transactionally links compatible confirmed holdings' public evidence/instrument references without rewriting their financial values, enriches matching submitted applications across accounts while preserving submitted status/amounts, creates deduplicated own-account alerts and queues the existing push delivery system. Pending alert: `kind=pending,stage=issuance,purchaseId,documentId`. Historical evidence alert: `kind=documents,stage=issuance,documentId,purchaseId`. Neither contains another investor's amount or publisher identity. Device refresh/push delivery remains subject to the existing setup; no realtime guarantees.
 
 Public sources never confirm personal allocation. Full policy, explicit beta trust limitations and future staff-review gate: companion KMP `docs/SHARED_DOCUMENTS.md`.
+
+## Security coupon projection — 1 November 2026
+
+`GET /coupon-terms` is authenticated and returns the public security-only allowlist described in [PRIVATE_COUPON_TERMS.md](PRIVATE_COUPON_TERMS.md). A saved private confirmation may contribute rates/explicit coupon dates, but no private file or investor/source/amount/acquisition metadata becomes shared. Source priority/conflict handling is explicit; no automatic personal allocation confirmation or historical financial rewrite. Deploy additive migration V10 before the corresponding mobile build.

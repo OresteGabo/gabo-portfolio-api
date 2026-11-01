@@ -43,7 +43,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -605,6 +605,37 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(id,data(repeated)["purchase"].record()["id"])
         assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
         assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+    }
+
+    @Test fun `private confirmations share only security coupons and conflicting contributors never choose a rate`() {
+        val (_,a)=user();val (_,b)=user()
+        val proof=data(upload(a)).text("documentId")
+        val dates=listOf("2027-04-23","2031-10-23")
+        val input=bond("active")+mapOf("confirmationDocumentId" to proof,"couponDates" to dates,"firstCouponDate" to dates.first(),
+            "scheduleConfidence" to "confirmed","accountReference" to "SECRET-ACCOUNT","notes" to "SECRET-NOTES","broker" to "SECRET-BROKER")
+        val saved=call("/purchases","POST",input,a);assertEquals(201,saved.statusCode(),saved.body())
+        db.update("UPDATE bond_security_coupon_terms SET terms=terms||?::jsonb WHERE isin='RWTEST123456'",json.write(mapOf("privateMarker" to "SECRET-EXTRA","ownerId" to "SECRET-OWNER")))
+        val response=call("/coupon-terms",cookie=b);assertEquals(200,response.statusCode(),response.body())
+        val public=data(response).records("terms").single { it.text("isin")=="RWTEST123456" }
+        assertEquals(.12,public.number("couponRate"));assertEquals(dates,public.strings("couponDates"))
+        assertEquals("document-extracted",public["source"])
+        assertEquals(setOf("isin","issuer","currency","instrumentType","maturityDate","couponRate","couponFrequency","tenorYears","couponDates","source"),public.keys)
+        assertFalse(response.body().contains("SECRET"));assertFalse(response.body().contains(proof))
+        assertEquals(401,call("/coupon-terms").statusCode())
+        assertEquals(404,call("/documents/$proof",cookie=b).statusCode())
+        assertTrue(data(call("/documents",cookie=b)).records("documents").isEmpty())
+        val proofB=data(upload(b)).text("documentId")
+        val conflict=call("/purchases","POST",input+mapOf("confirmationDocumentId" to proofB,"couponRate" to .13),b)
+        assertEquals(201,conflict.statusCode(),conflict.body())
+        assertTrue(data(call("/coupon-terms",cookie=b)).records("terms").none { it.text("isin")=="RWTEST123456" })
+        assertEquals(.12,data(call("/purchases",cookie=a)).records("purchases").single().number("couponRate"))
+        assertEquals(.13,data(call("/purchases",cookie=b)).records("purchases").single().number("couponRate"))
+        // An established public instrument can resolve the display source without exposing the private records.
+        val official=input+mapOf("isin" to "RWTEST123456","couponRate" to .12)
+        db.update("INSERT INTO bond_instruments(id,isin,settlement_date,terms) VALUES ('issuance-synthetic-authority','RWTEST123456','2026-10-23',?::jsonb)",json.write(official))
+        val resolved=data(call("/coupon-terms",cookie=b)).records("terms").single { it.text("isin")=="RWTEST123456" }
+        assertEquals(.12,resolved.number("couponRate"));assertEquals("published",resolved["source"])
+        assertFalse(json.write(resolved).contains("SECRET"))
     }
 
     @Test fun `legacy investments gain owned evidence without duplicates or financial changes`() {

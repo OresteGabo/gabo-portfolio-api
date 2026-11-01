@@ -46,6 +46,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 checkApi(uuid(incomingProof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",incomingProof,owner).isNotEmpty(),"Confirmation PDF not found.")
                 checkApi(existing.text("confirmationDocumentId").isBlank() || existing.text("confirmationDocumentId")==incomingProof,"This purchase already has another confirmation PDF.",409)
                 db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",incomingProof,owner,prior["id"])
+                instruments.contributePrivateCouponTerms(purchase)
                 return bond(owner,prior.text("id"))!!
             }
         }
@@ -60,6 +61,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         if(proof.isNotBlank()) {
             checkApi(uuid(proof) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE id=?::uuid AND owner_id=? AND metadata->>'category'='Bond confirmation'",proof,owner).isNotEmpty(),"Confirmation PDF not found.")
             db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid WHERE id=?::uuid",proof,p["id"])
+            instruments.contributePrivateCouponTerms(p)
         }
         pending.refresh(owner)
         return bond(owner,p.text("id"))!!

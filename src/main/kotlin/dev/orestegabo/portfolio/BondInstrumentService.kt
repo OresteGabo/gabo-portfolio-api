@@ -29,6 +29,35 @@ class BondInstrumentService(private val db: JdbcTemplate,private val json: JsonC
             mapOf("stage" to "issuance","purchaseId" to row["id"],"documentId" to id,"title" to terms["bondName"],"action" to "document"))
 
     }
+    /** Called only after an owned personal confirmation PDF has been checked by PortfolioService. */
+    fun contributePrivateCouponTerms(p: Record) {
+        if(p.text("status") !in listOf("active","matured","sold"))return
+        val projected=PublicCouponTerms.project(p) ?: return
+        db.update("INSERT INTO bond_security_coupon_terms(isin,maturity_date,terms) VALUES (?,?::date,?::jsonb) ON CONFLICT DO NOTHING",
+            projected["isin"],projected["maturityDate"],json.write(projected))
+        val stored=db.queryForList("SELECT terms,conflicted FROM bond_security_coupon_terms WHERE isin=? AND maturity_date=?::date FOR UPDATE",
+            projected["isin"],projected["maturityDate"]).single()
+        val old=json.read(stored["terms"].toString())
+        if(!PublicCouponTerms.compatible(old,projected)) {
+            // Keep the private transaction, but do not choose between conflicting contributors.
+            db.update("UPDATE bond_security_coupon_terms SET conflicted=true WHERE isin=? AND maturity_date=?::date",projected["isin"],projected["maturityDate"])
+        } else if(stored["conflicted"]!=true) {
+            val merged=old+mapOf("couponDates" to (old.strings("couponDates")+projected.strings("couponDates")).distinct().sorted())
+            db.update("UPDATE bond_security_coupon_terms SET terms=?::jsonb WHERE isin=? AND maturity_date=?::date",json.write(merged),projected["isin"],projected["maturityDate"])
+        }
+    }
+    fun sharedCouponTerms(): List<Record> {
+        val published=instruments().mapNotNull { PublicCouponTerms.project(it)?.plus("source" to "published") }
+        val extracted=db.query("SELECT terms FROM bond_security_coupon_terms WHERE NOT conflicted",{r,_->json.read(r.getString(1))})
+            .mapNotNull { PublicCouponTerms.project(it+mapOf("scheduleConfidence" to "confirmed")) }
+        return (published+extracted).groupBy { it.text("isin") to it.text("maturityDate") }.values.mapNotNull { candidates ->
+            val official=candidates.filter { it.text("source")=="published" }
+            val chosen=official.ifEmpty { candidates }
+            val first=chosen.first()
+            if(chosen.any { !PublicCouponTerms.compatible(first,it) })null
+            else first+mapOf("couponDates" to chosen.flatMap { it.strings("couponDates") }.distinct().sorted())
+        }
+    }
     fun options(item: Record,available: List<Record> = instruments()): List<Record> = if(item.text("kind")!="bond") emptyList() else available.filter {
         val settlement=date(it.text("settlementDate"));val posting=date(item.text("date"))
         settlement!=null && posting!=null && ChronoUnit.DAYS.between(settlement,posting) in 0..7 &&

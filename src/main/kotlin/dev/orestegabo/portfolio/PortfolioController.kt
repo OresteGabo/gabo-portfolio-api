@@ -10,7 +10,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 @RestController
 @RequestMapping("/api/bonds")
-class PortfolioController(private val portfolio: PortfolioService,private val documents: DocumentService,private val statements: StatementService) {
+class PortfolioController(private val portfolio: PortfolioService,private val documents: DocumentService,private val statements: StatementService,private val instruments: BondInstrumentService) {
+    @GetMapping("/coupon-terms") fun couponTerms(): Record { currentAccount(); return mapOf("terms" to instruments.sharedCouponTerms()) }
     @GetMapping("/purchases") fun bonds()=mapOf("purchases" to portfolio.bonds(currentAccount().id))
     @GetMapping("/purchases/{id}") fun bond(@PathVariable id: String): Record {
         checkApi(uuid(id),"Invalid purchase id.")
