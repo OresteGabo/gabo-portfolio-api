@@ -60,3 +60,23 @@ Unlike an alerts-only budget, this cap can pause new Cloud Run usage and make th
 The user selected €35 total across providers. The existing Cloud Run enforcement cap was reduced to **€25/month**, state `CONFIGURED`; a separate **€35/month all-services Google project alerts-only budget** was created/read back. Both use EUR gross cost; 50%/80%/100% alerts remain enabled. Added service-level maximum 1 and verified minimum 1, ready revision and complete container template unchanged. The €10 remainder is planning headroom, not an enforced cap on image storage/logs/network/other fees.
 
 Linked production Neon is Free (datasource host matched the audited project); Vercel team is Hobby with no invoice add-ons returned. Existing free limits retained, no plan upgrade. Public repositories use standard hosted GitHub runners; paid account-level storage budgets were not changed. Domain renewals remain separate. Full verified scope and limits: companion KMP `docs/COST_CONTROLS.md`. **There is no guaranteed €35 combined invoice ceiling.** This section supersedes the earlier €35 Cloud Run-only allocation.
+
+## Optional migration role separation — security review 31 October 2026
+
+The cloudrun profile accepts `GABO_MIGRATION_DATABASE_USER` and
+`GABO_MIGRATION_DATABASE_PASSWORD`, alongside the existing direct
+`GABO_MIGRATION_DATABASE_URL`. Runtime queries still use `GABO_DATABASE_USER` and
+`GABO_DATABASE_PASSWORD`. Unset migration credentials fall back to the existing
+runtime credentials for backward compatibility. This configuration change alone
+**does not establish least privilege**; actual production grants were not read or changed.
+
+Before beta, an authorized operator should inspect grants on a restored synthetic
+or sanitized branch, create a separate schema-owning migration role and a runtime
+role with only required table/sequence DML, and arrange default privileges for
+future migration-created objects. Test Flyway startup and all API operations with
+those roles; verify the runtime cannot create/drop tables or change grants.
+Store both credentials privately through the established secret manager. Deploy
+and revoke old grants only after explicit review and a tested rollback/recovery
+plan. Do not paste role passwords or real database dumps into issues or CI logs.
+The two new synthetic configuration tests verify role/URL separation and fallback;
+they do not prove the production database's permissions.
