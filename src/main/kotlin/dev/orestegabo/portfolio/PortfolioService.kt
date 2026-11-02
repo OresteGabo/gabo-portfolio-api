@@ -34,7 +34,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
     fun shares(owner: String): List<Record> = db.query("SELECT holding FROM equity_purchases WHERE owner_id=? ORDER BY holding->>'tradeDate' DESC,created_at DESC", { r,_ -> json.read(r.getString(1)) },owner)
-    @Transactional fun saveBond(owner: String, raw: Record, id: String? = null): Record {
+    @Transactional fun saveBond(owner: String, raw: Record, id: String? = null, contributeCouponTerms: Boolean = true): Record {
         lockAccount(db,owner)
         val purchase = validation.bond(raw)
         val incomingProof=raw.text("confirmationDocumentId")
@@ -48,7 +48,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 val priorProof=existing.text("confirmationDocumentId")
                 checkApi(priorProof.isBlank() || documents.ownedEvidenceId(owner,priorProof,"Bond confirmation")==canonicalProof,"This purchase already has another confirmation PDF.",409)
                 db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",canonicalProof,owner,prior["id"])
-                instruments.contributePrivateCouponTerms(purchase)
+                if(contributeCouponTerms) instruments.contributePrivateCouponTerms(purchase)
                 return bond(owner,prior.text("id"))!!
             }
         }
@@ -62,7 +62,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         val proof=raw.text("confirmationDocumentId")
         if(proof.isNotBlank()) {
             db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid WHERE id=?::uuid",canonicalProof,p["id"])
-            instruments.contributePrivateCouponTerms(p)
+            if(contributeCouponTerms) instruments.contributePrivateCouponTerms(p)
         }
         pending.refresh(owner)
         return bond(owner,p.text("id"))!!
@@ -81,11 +81,11 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         lockAccount(db,owner); checkApi(uuid(id),"Invalid purchase id.")
         return db.update("DELETE FROM bond_purchases WHERE owner_id=? AND id=?::uuid",owner,id)>0
     }
-    @Transactional fun saveShare(owner: String,raw: Record): Record {
+    @Transactional fun saveShare(owner: String,raw: Record,preserveNotes: Boolean = false): Record {
         lockAccount(db,owner)
         val documentId=raw.text("contractDocumentId").takeIf(String::isNotBlank)
         if(documentId!=null)checkApi(uuid(documentId) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE owner_id=? AND id=?::uuid AND metadata->>'category'='Share contract'",owner,documentId).isNotEmpty(),"Share contract PDF not found.")
-        val p = validation.equity(raw)+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
+        val p = validation.equity(raw)+(if(preserveNotes)mapOf("notes" to raw.text("notes").trim().also { checkApi(it.length<=1000,"Notes are too long.") }) else emptyMap())+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
         if(documentId!=null) {
             val candidates=shares(owner).filter { validation.equityKey(it)==validation.equityKey(p) }
             checkApi(candidates.size<=1,"Multiple matching purchases require review.",409)

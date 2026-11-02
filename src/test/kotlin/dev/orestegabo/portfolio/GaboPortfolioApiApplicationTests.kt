@@ -37,13 +37,14 @@ class GaboPortfolioApiApplicationTests {
             p.add("gabo.admin-password-hash") { Passwords.hash(password) }
             p.add("gabo.allowed-origins") { "https://web.example.test" }
             p.add("gabo.cookie-secure") { false }
+            for (key in listOf("gabo.friend-email","gabo.friend-password-hash","gabo.push.firebase-project","gabo.push.apple-team","gabo.push.apple-key-id","gabo.push.apple-key","gabo.import-web-directory")) p.add(key) { "" }
             p.add("gabo.cron-secret") { "synthetic-cron-secret" }
             p.add("gabo.snapshot-secret") { "synthetic-snapshot-secret" }
         }
     }
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -839,6 +840,108 @@ class GaboPortfolioApiApplicationTests {
         assertTrue(data(call("/notifications/sign-in-activity",cookie=b)).records("devices").isEmpty())
         assertEquals(400,call("/notifications/sign-in-activity?notificationId=invalid",cookie=a).statusCode())
         assertEquals(401,call("/notifications/sign-in-activity").statusCode())
+    }
+
+    private fun guestItem(source: String="guest:bond:synthetic-one",kind: String="bond",record: Record=bond("active"),account: String="owner",docs: List<String> = emptyList()): Record =
+        mapOf("accountId" to account,"confirmed" to true,"sourceId" to source,"kind" to kind,"record" to record,"documentIds" to docs)
+
+    @Test fun `guest migration requires authentication explicit confirmation and the current account`() {
+        val body=guestItem()
+        assertEquals(401,call("/guest-migration/items","POST",body).statusCode())
+        val cookie=login()
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("confirmed" to false),cookie).statusCode())
+        assertEquals(403,call("/guest-migration/items","POST",body+mapOf("accountId" to "another-account"),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("sourceId" to "sample:bond"),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("ownerId" to "another-account"))),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("confirmationDocumentId" to newId()))),cookie).statusCode())
+        assertEquals(403,call("/guest-migration/status?accountId=another-account",cookie=cookie).statusCode())
+        assertTrue(data(call("/guest-migration/status?accountId=owner",cookie=cookie)).records("items").isEmpty())
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+    }
+    @Test fun `guest migration retries are atomic and exact existing investments are matched without replacing notes`() {
+        val cookie=login();val body=guestItem(record=bond("active")+mapOf("notes" to "original private note"))
+        val first=call("/guest-migration/items","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        val again=call("/guest-migration/items","POST",body,cookie);assertEquals(200,again.statusCode(),again.body())
+        assertEquals(data(first)["targetId"],data(again)["targetId"]);assertEquals("already-transferred",data(again)["status"])
+        val matched=call("/guest-migration/items","POST",guestItem(source="guest:bond:second-source",record=bond("active")+mapOf("notes" to "do not overwrite")),cookie)
+        assertEquals(200,matched.statusCode(),matched.body());assertEquals("matched",data(matched)["status"])
+        val rows=data(call("/purchases",cookie=cookie)).records("purchases");assertEquals(1,rows.size);assertEquals("original private note",rows.single()["notes"])
+        assertEquals(409,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("feesPaid" to 999))),cookie).statusCode())
+        assertEquals(409,call("/guest-migration/items","POST",guestItem(source="guest:bond:collision",record=bond("active")+mapOf("isin" to "RWOTHER12345")),cookie).statusCode())
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+        call("/purchases/${data(first).text("targetId")}","DELETE",cookie=cookie)
+        assertEquals(409,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+    }
+    @Test fun `guest migration equity retries and concurrent submissions cannot duplicate lots`() {
+        val cookie=login();val body=guestItem("guest:share:synthetic-equity","equity",equity()+mapOf("notes" to "keep local note"))
+        val executor=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val jobs=(1..2).map { executor.submit<HttpResponse<String>> { call("/guest-migration/items","POST",body,cookie) } }
+            val responses=jobs.map { it.get(20,java.util.concurrent.TimeUnit.SECONDS) }
+            responses.forEach { assertEquals(200,it.statusCode(),it.body()) }
+            assertEquals(data(responses[0])["targetId"],data(responses[1])["targetId"])
+        } finally { executor.shutdownNow() }
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM equity_purchases",Int::class.java))
+        assertEquals("keep local note",data(call("/equities",cookie=cookie)).records("holdings").single()["notes"])
+    }
+    @Test fun `guest migration only uploads private selected originals with account bound chunk retries`() {
+        val cookie=login();val bytes="%PDF-1.7\nprivate synthetic migration\n%%EOF".toByteArray()
+        val digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val metadata=mapOf("category" to "Bond confirmation","label" to "Bond confirmation","instrumentName" to "","issuer" to "","documentDate" to "2026-10-23")
+        val body=mapOf("accountId" to "owner","confirmed" to true,"sourceId" to "guest:document:synthetic-doc","sha256" to digest,"metadata" to metadata,
+            "uploadId" to "b".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString(bytes))
+        val first=call("/guest-migration/documents","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        val again=call("/guest-migration/documents","POST",body,cookie);assertEquals(data(first)["documentId"],data(again)["documentId"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals("2026-10-23", data(call("/guest-migration/status?accountId=owner",cookie=cookie)).records("items").single()["documentDate"])
+        assertEquals(400,call("/guest-migration/documents","POST",body+mapOf("sourceId" to "guest:document:public-attempt","metadata" to (metadata+mapOf("category" to "Bond issuance","label" to "Bond issuance"))),cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        val (otherId,other)=user()
+        assertEquals(403,call("/guest-migration/documents","POST",body,other).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",guestItem(account=otherId,docs=listOf(data(first).text("documentId"))),other).statusCode())
+        val saved=call("/guest-migration/items","POST",guestItem(docs=listOf(data(first).text("documentId"))),cookie)
+        assertEquals(200,saved.statusCode(),saved.body())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_security_coupon_terms",Int::class.java))
+    }
+    @Test fun `guest migration preserves receipt method and never overwrites a conflicting account receipt`() {
+        val cookie=login();val terms=bond("active")+mapOf("purchaseDate" to "2025-01-01","settlementDate" to "2025-01-02","maturityDate" to "2030-01-01","couponDates" to listOf("2025-07-01","2026-01-01","2030-01-01"))
+        val parent=call("/guest-migration/items","POST",guestItem(record=terms),cookie);assertEquals(200,parent.statusCode(),parent.body())
+        val raw=mapOf("parentSourceId" to "guest:bond:synthetic-one","dueDate" to "2026-01-01","amount" to 68400,"received" to true,"method" to "automatic","currency" to "RWF","recordedAt" to "2026-01-01T12:00:00Z")
+        val body=guestItem("guest:receipt:synthetic-receipt","receipt",raw)
+        val first=call("/guest-migration/items","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        assertEquals(200,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals("automatic",data(call("/notifications/coupons",cookie=cookie)).records("receipts").single()["method"])
+        assertEquals(200,call("/notifications/coupons","POST",mapOf("purchaseId" to data(parent)["targetId"],"dueDate" to "2026-01-01","received" to false),cookie).statusCode())
+        assertEquals(409,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals(false,data(call("/notifications/coupons",cookie=cookie)).records("receipts").single()["received"])
+        val (id,other)=user()
+        assertEquals(409,call("/guest-migration/items","POST",body+mapOf("accountId" to id),other).statusCode())
+    }
+    @Test fun `guest migration acknowledgments are isolated and removed by account deletion`() {
+        val (id,cookie)=user()
+        val response=call("/guest-migration/items","POST",guestItem(account=id),cookie);assertEquals(200,response.statusCode(),response.body())
+        assertEquals(1,data(call("/guest-migration/status?accountId=$id",cookie=cookie)).records("items").size)
+        assertTrue(data(call("/guest-migration/status?accountId=owner",cookie=login())).records("items").isEmpty())
+        assertEquals(200,call("/auth/account","DELETE",mapOf("password" to password),cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM guest_migration_items WHERE owner_id=?",Int::class.java,id))
+    }
+
+    @Test fun `guest migration document chunks resume after an interruption and metadata conflicts fail closed`() {
+        val cookie=login()
+        val bytes=("%PDF-1.7\n"+"synthetic ".repeat(70000)+"\n%%EOF").toByteArray()
+        val hash=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val metadata=mapOf("category" to "Share contract","label" to "Share contract","instrumentName" to "","issuer" to "","documentDate" to "2026-09-24")
+        val base=mapOf("accountId" to "owner","confirmed" to true,"sourceId" to "guest:document:chunked","sha256" to hash,"metadata" to metadata,"uploadId" to "c".repeat(32),"count" to 2)
+        val first=base+mapOf("index" to 0,"content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(0,512*1024)))
+        assertEquals(200,call("/guest-migration/documents","POST",first,cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(200,call("/guest-migration/documents","POST",first,cookie).statusCode())
+        val last=base+mapOf("index" to 1,"content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(512*1024,bytes.size)))
+        val saved=call("/guest-migration/documents","POST",last,cookie);assertEquals(200,saved.statusCode(),saved.body())
+        assertEquals(data(saved)["documentId"],data(call("/guest-migration/documents","POST",last,cookie))["documentId"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(409,call("/guest-migration/documents","POST",last+mapOf("metadata" to (metadata+mapOf("documentDate" to "2026-09-25"))),cookie).statusCode())
     }
 
 }

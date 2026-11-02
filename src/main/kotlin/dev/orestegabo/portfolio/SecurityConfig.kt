@@ -65,7 +65,8 @@ class SecurityConfig(
                             val origin = request.getHeader("Origin")
                             checkApi(origin != null && runCatching { URI(origin).let { it.scheme + "://" + it.rawAuthority } }.getOrNull() in origins, "Invalid request origin.", 403)
                             val limit = when {
-                                request.requestURI == "/api/bonds/documents" -> 710000
+                                request.requestURI in listOf("/api/bonds/documents", "/api/bonds/guest-migration/documents") -> 710000
+                                request.requestURI == "/api/bonds/guest-migration/items" -> 65536
                                 request.requestURI == "/api/bonds/statement-items" -> 131072
                                 request.requestURI.startsWith("/api/bonds/purchases") -> 32768
                                 request.requestURI == "/api/bonds/equities" -> 16384
