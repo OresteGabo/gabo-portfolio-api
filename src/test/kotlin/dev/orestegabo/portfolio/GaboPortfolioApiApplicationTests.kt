@@ -43,7 +43,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -841,4 +841,96 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(401,call("/notifications/sign-in-activity").statusCode())
     }
 
+
+    private fun applicationFormBody(uploadId: Char='a', pdf: String="%PDF-1.7\nsynthetic blank application\n%%EOF", calendar: String="2026-11-5y-new"): Record = mapOf(
+        "uploadId" to uploadId.toString().repeat(32), "index" to 0, "count" to 1,
+        "content" to Base64.getEncoder().encodeToString(pdf.toByteArray()),
+        "metadata" to mapOf("category" to "Bond application", "calendarId" to calendar,
+            "label" to "Blank application", "documentDate" to "2026-11-11", "instrumentName" to "Five-year bond", "issuer" to "BNR"))
+
+    @Test fun `application form uploads require the actual owner on every chunk`() {
+        val (_, invited)=user()
+        val body=applicationFormBody()
+        assertEquals(401,call("/documents","POST",body).statusCode())
+        assertEquals(403,call("/documents","POST",body+mapOf("isOwner" to true,"ownerId" to "owner","canPublishPublicData" to true),invited).statusCode())
+        assertEquals(403,call("/documents","POST",body+mapOf("index" to 1,"count" to 2),invited).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+        assertEquals(401,call("/application-forms").statusCode())
+    }
+
+    @Test fun `application form is one global PDF shared across accounts and retries`() {
+        val owner=login()
+        val body=applicationFormBody()
+        val first=call("/documents","POST",body,owner)
+        assertEquals(200,first.statusCode(),first.body())
+        val id=data(first).text("documentId")
+        val pool=java.util.concurrent.Executors.newFixedThreadPool(3)
+        try {
+            val retries=listOf('b','c','d').map { part -> pool.submit<HttpResponse<String>> { call("/documents","POST",applicationFormBody(part),owner) } }
+            retries.forEach { task ->
+                val retry=task.get(30,java.util.concurrent.TimeUnit.SECONDS)
+                assertEquals(200,retry.statusCode(),retry.body())
+                assertEquals(id,data(retry).text("documentId"))
+                assertEquals(true,data(retry)["duplicate"])
+            }
+        } finally { pool.shutdownNow() }
+        val (_, invited)=user()
+        val rows=data(call("/application-forms",cookie=invited)).records("forms")
+        assertEquals(listOf(id),rows.map { it.text("id") })
+        assertEquals("shared",rows.single().text("visibility"))
+        assertEquals("2026-11-13",rows.single()["applicationForm"].record().text("settlementDate"))
+        val downloaded=call("/documents/$id",cookie=invited)
+        assertEquals(200,downloaded.statusCode())
+        assertEquals("%PDF-1.7\nsynthetic blank application\n%%EOF",downloaded.body())
+        assertEquals(401,call("/documents/$id").statusCode())
+        assertTrue(data(call("/documents",cookie=invited)).records("documents").any { it.text("id")==id })
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+    }
+
+    @Test fun `application form conflicts never overwrite a published source or duplicate its bytes`() {
+        val cookie=login()
+        val first=call("/documents","POST",applicationFormBody(),cookie)
+        assertEquals(200,first.statusCode(),first.body())
+        val id=data(first).text("documentId")
+        assertEquals(409,call("/documents","POST",applicationFormBody('b',"%PDF-1.7\ndifferent form\n%%EOF"),cookie).statusCode())
+        assertEquals(409,call("/documents","POST",applicationFormBody('c',calendar="2026-12-7y-reopen"),cookie).statusCode())
+        assertEquals("%PDF-1.7\nsynthetic blank application\n%%EOF",call("/documents/$id",cookie=cookie).body())
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+    }
+
+    @Test fun `application form binds to server calendar and validates PDF before publication`() {
+        val cookie=login()
+        assertEquals(400,call("/documents","POST",applicationFormBody(calendar="invented-issuance"),cookie).statusCode())
+        assertEquals(400,call("/documents","POST",applicationFormBody(pdf="%PDF-1.7\nmissing end marker"),cookie).statusCode())
+        val body=applicationFormBody()
+        val spoofed=body+mapOf("metadata" to (body["metadata"].record()+mapOf("applicationForm" to mapOf("settlementDate" to "2099-01-01"),"visibility" to "private")))
+        val result=call("/documents","POST",spoofed,cookie)
+        assertEquals(200,result.statusCode(),result.body())
+        val stored=data(call("/application-forms",cookie=cookie)).records("forms").single()
+        assertEquals("2026-11-13",stored["applicationForm"].record().text("settlementDate"))
+        assertEquals("shared",stored.text("visibility"))
+    }
+
+    @Test fun `application form stays hidden until the owner completes every chunk`() {
+        val owner=login()
+        val (_, invited)=user()
+        val first=ByteArray(512*1024) { 32 }.apply { "%PDF-1.7\n".toByteArray().copyInto(this) }
+        val last="\n%%EOF".toByteArray()
+        val body=applicationFormBody()+mapOf("count" to 2,"content" to Base64.getEncoder().encodeToString(first))
+        assertEquals(200,call("/documents","POST",body,owner).statusCode())
+        assertTrue(data(call("/application-forms",cookie=invited)).records("forms").isEmpty())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+        val tail=body+mapOf("index" to 1,"content" to Base64.getEncoder().encodeToString(last))
+        assertEquals(403,call("/documents","POST",tail,invited).statusCode())
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+        val completed=call("/documents","POST",tail,owner)
+        assertEquals(200,completed.statusCode(),completed.body())
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
+        assertEquals(1,data(call("/application-forms",cookie=invited)).records("forms").size)
+    }
 }
