@@ -19,15 +19,18 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
                 WHERE ticker=q.ticker AND observed_date<q.observed_date ORDER BY observed_date DESC LIMIT 1
             ) p ON true WHERE q.observed_date=?::date AND q.closing_price<>p.closing_price
         ), positions AS (
-            SELECT owner_id,holding->>'ticker' ticker,sum((holding->>'shares')::numeric) shares,
-                sum((holding->>'netAmountPayable')::numeric) cash_cost
-            FROM equity_purchases WHERE holding->>'status'='active' AND holding->>'currency'='RWF'
+            SELECT owner_id,holding->>'ticker' ticker,sum((holding->>'shares')::numeric-COALESCE(s.sold,0)) shares,
+                sum((holding->>'netAmountPayable')::numeric-COALESCE(s.cost,0)) cash_cost
+            FROM equity_purchases e LEFT JOIN LATERAL (
+                SELECT sum((payload->>'shares')::numeric) AS sold,sum((payload->>'allocatedCost')::numeric) AS cost FROM investment_cash_ledger
+                WHERE owner_id=e.owner_id AND payload->>'holdingId'=e.id::text AND payload->>'kind'='sale' AND payload->>'date'<=?
+            ) s ON true WHERE holding->>'status'='active' AND holding->>'currency'='RWF'
                 AND holding->>'exchange'='RSE' AND holding->>'tradeDate'<=? GROUP BY owner_id,holding->>'ticker'
         ) INSERT INTO notifications(owner_id,ticker,market_date,previous_date,previous_price,closing_price,shares,cash_cost,event_key)
             SELECT s.owner_id,q.ticker,q.observed_date,q.previous_date,q.previous_price,q.closing_price,s.shares,s.cash_cost,'price:'||q.ticker||':'||q.observed_date
             FROM latest q JOIN positions s USING(ticker) WHERE s.shares>0 AND COALESCE((SELECT (categories->>'prices')::boolean FROM notification_preferences WHERE owner_id=s.owner_id),true)
                 AND NOT EXISTS(SELECT 1 FROM bond_users u WHERE u.id=s.owner_id AND u.disabled_at IS NOT NULL)
-            ON CONFLICT(owner_id,ticker,market_date) DO NOTHING""",date.toString(),date.toString())
+            ON CONFLICT(owner_id,ticker,market_date) DO NOTHING""",date.toString(),date.toString(),date.toString())
         queue()
         return count
     }

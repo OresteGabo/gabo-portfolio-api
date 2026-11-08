@@ -33,7 +33,15 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         }
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
-    fun shares(owner: String): List<Record> = db.query("SELECT holding FROM equity_purchases WHERE owner_id=? ORDER BY holding->>'tradeDate' DESC,created_at DESC", { r,_ -> json.read(r.getString(1)) },owner)
+    fun shares(owner: String): List<Record> = db.query("""SELECT holding || jsonb_build_object(
+        'remainingShares',(holding->>'shares')::numeric-COALESCE(s.sold,0),
+        'soldShares',COALESCE(s.sold,0),
+        'remainingCost',(holding->>'netAmountPayable')::numeric-COALESCE(s.cost,0))
+        FROM equity_purchases e LEFT JOIN LATERAL (
+            SELECT sum((payload->>'shares')::numeric) AS sold,sum((payload->>'allocatedCost')::numeric) AS cost
+            FROM investment_cash_ledger WHERE owner_id=e.owner_id AND payload->>'holdingId'=e.id::text AND payload->>'kind'='sale'
+        ) s ON true WHERE owner_id=? ORDER BY holding->>'tradeDate' DESC,created_at DESC""", { r,_ -> json.read(r.getString(1)) },owner)
+
     @Transactional fun saveBond(owner: String, raw: Record, id: String? = null, contributeCouponTerms: Boolean = true): Record {
         lockAccount(db,owner)
         val purchase = validation.bond(raw)
@@ -124,7 +132,7 @@ object MobileOverview {
         val rb=recent(bonds,"purchaseDate"); val rs=recent(shares,"tradeDate")
         val bIds=rb.map { it["id"] }.toSet(); val sIds=rs.map { it["id"] }.toSet()
         val basis=bonds.filter { it.text("status")=="active" && it["id"] !in bIds }.map { it.filterKeys { k->k !in listOf("notes","sourceUrl","accountReference","createdAt") } }
-        val positions=shares.filter { it.text("status")=="active" && it.text("tradeDate")<=through && it["id"] !in sIds }.groupBy { listOf(it.text("currency"),it.text("ticker")) }.map { (key,rows)-> mapOf("id" to "aggregate:[\"${key[0]}\",\"${key[1]}\"]","currency" to key[0],"ticker" to key[1],"status" to "active","tradeDate" to rows.minOf { it.text("tradeDate") },"shares" to rows.sumOf { it.decimal("shares") },"netAmountPayable" to rows.sumOf { it.decimal("netAmountPayable") },"lotCount" to rows.size) }
+        val positions=shares.filter { it.text("status")=="active" && it.text("tradeDate")<=through && it["id"] !in sIds }.groupBy { listOf(it.text("currency"),it.text("ticker")) }.map { (key,rows)-> mapOf("id" to "aggregate:[\"${key[0]}\",\"${key[1]}\"]","currency" to key[0],"ticker" to key[1],"status" to "active","tradeDate" to rows.minOf { it.text("tradeDate") },"shares" to rows.sumOf { if(it.containsKey("remainingShares"))it.decimal("remainingShares") else it.decimal("shares") },"netAmountPayable" to rows.sumOf { if(it.containsKey("remainingCost"))it.decimal("remainingCost") else it.decimal("netAmountPayable") },"lotCount" to rows.size) }
         return mapOf("version" to 1,"from" to from,"through" to through,"previewLimit" to 12,"monthlyInvestmentTotals" to totals(bonds,shares,today),"recentPurchaseIds" to bIds.toList(),"recentHoldingIds" to sIds.toList(),"purchases" to rb+basis,"holdings" to rs+positions)
     }
     fun totals(bonds: List<Record>,shares: List<Record>,today: LocalDate): List<Record> {

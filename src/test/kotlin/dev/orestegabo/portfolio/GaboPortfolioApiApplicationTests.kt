@@ -44,7 +44,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE investment_cash_ledger,bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -835,7 +835,7 @@ class GaboPortfolioApiApplicationTests {
         val activity=data(response);assertEquals(second,activity["highlightDeviceId"])
         assertEquals(setOf(first,second,third),activity.records("devices").map { it.text("deviceId") }.toSet())
         assertEquals(second,activity.records("devices").first().text("deviceId"))
-        assertTrue(activity.records("devices").all { it.keys==setOf("deviceId","platform","firstSeen") })
+        assertTrue(activity.records("devices").all { it.keys==setOf("deviceId","platform","firstSeen","lastSeen") })
         assertEquals(404,call("/notifications/sign-in-activity?notificationId=$id",cookie=b).statusCode())
         assertTrue(data(call("/notifications/sign-in-activity",cookie=b)).records("devices").isEmpty())
         assertEquals(400,call("/notifications/sign-in-activity?notificationId=invalid",cookie=a).statusCode())
@@ -1036,4 +1036,95 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
         assertEquals(1,data(call("/application-forms",cookie=invited)).records("forms").size)
     }
+    @Test fun `security device context is bounded private and snapshots the new device alert`() {
+        val (owner,cookie)=user()
+        lifecycle.signIn(owner,newId(),"ios")
+        val device=newId()
+        val context=mapOf("deviceModel" to "Google Pixel 8", "osVersion" to "Android 16", "appVersion" to "1.0 (42)", "ownerId" to "spoofed", "firstSeen" to "2099-01-01")
+        assertEquals(200,call("/notifications/session-device","POST",context+mapOf("deviceId" to device,"platform" to "android"),cookie).statusCode())
+        val alert=data(call("/notifications",cookie=cookie)).records("notifications").single { it.text("kind")=="security" }
+        assertEquals("Google Pixel 8",alert.text("deviceModel"))
+        assertEquals("Android 16",alert.text("osVersion"))
+        assertTrue(java.time.Instant.parse(alert.text("signedInAt"))<=java.time.Instant.now())
+        val before=data(call("/notifications/sign-in-activity",cookie=cookie)).records("devices").single { it.text("deviceId")==device }
+        assertEquals("1.0 (42)",before.text("appVersion"))
+        assertFalse(before.containsKey("ownerId"))
+        assertFalse(before.text("firstSeen").startsWith("2099"))
+        lifecycle.signIn(owner,device,"android",mapOf("deviceModel" to "x".repeat(121),"osVersion" to "bad\nvalue","appVersion" to "1.1 (43)"))
+        val after=data(call("/notifications/sign-in-activity",cookie=cookie)).records("devices").single { it.text("deviceId")==device }
+        assertEquals("Google Pixel 8",after.text("deviceModel"))
+        assertEquals("Android 16",after.text("osVersion"))
+        assertEquals("1.1 (43)",after.text("appVersion"))
+        assertEquals(before.text("firstSeen"),after.text("firstSeen"))
+        assertTrue(java.time.Instant.parse(after.text("lastSeen"))>=java.time.Instant.parse(before.text("lastSeen")))
+        val alerts=data(call("/notifications",cookie=cookie)).records("notifications").filter { it.text("kind")=="security" }
+        assertEquals(1,alerts.size)
+        assertEquals("1.0 (42)",alerts.single().text("appVersion"))
+        val (_,other)=user()
+        assertTrue(data(call("/notifications/sign-in-activity",cookie=other)).records("devices").isEmpty())
+    }
+
+    private fun ledgerEntry(kind: String="deposit",id: String=newId()) = mapOf("id" to id,"kind" to kind,"date" to "2026-01-01","currency" to "RWF","amount" to 40000)
+    @Test fun `cash ledger records are account scoped retry safe and validated`() {
+        val (_,a)=user();val (_,b)=user();val body=ledgerEntry()
+        assertEquals(401,call("/cash-ledger","POST",body).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,a).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,a).statusCode())
+        assertEquals(409,call("/cash-ledger","POST",body+mapOf("amount" to 50000),a).statusCode())
+        assertEquals(1,data(call("/cash-ledger",cookie=a)).records("entries").size)
+        assertTrue(data(call("/cash-ledger",cookie=b)).records("entries").isEmpty())
+        assertEquals(404,call("/cash-ledger/${body["id"]}","DELETE",cookie=b).statusCode())
+        assertEquals(400,call("/cash-ledger","POST",ledgerEntry()+mapOf("date" to "2099-01-01"),a).statusCode())
+        assertEquals(400,call("/cash-ledger","POST",ledgerEntry()+mapOf("amount" to -1),a).statusCode())
+        assertEquals(200,call("/cash-ledger/${body["id"]}","DELETE",cookie=a).statusCode())
+    }
+    @Test fun `partial share sales preserve purchases and derive net proceeds cost and remaining balances`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val body=mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 250,"price" to 110,"fees" to 100,"tax" to 0,"realizedGain" to 999999)
+        val sale=call("/cash-ledger","POST",body,cookie)
+        assertEquals(200,sale.statusCode(),sale.body())
+        val entry=data(sale)["entry"].record()
+        assertEquals(0,entry.decimal("allocatedCost").compareTo(java.math.BigDecimal("22775")))
+        assertEquals(0,entry.decimal("realizedGain").compareTo(java.math.BigDecimal("4625")))
+        val saved=data(call("/equities",cookie=cookie)).records("holdings").single()
+        assertEquals(1000.0,saved.number("shares"));assertEquals(750.0,saved.number("remainingShares"));assertEquals(68325.0,saved.number("remainingCost"))
+        assertEquals(409,call("/cash-ledger","POST",body+mapOf("id" to newId(),"shares" to 751),cookie).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,cookie).statusCode())
+        val (_,other)=user()
+        assertEquals(404,call("/cash-ledger","POST",body+mapOf("id" to newId()),other).statusCode())
+        assertEquals(200,call("/cash-ledger/${body["id"]}","DELETE",cookie=cookie).statusCode())
+        assertEquals(1000.0,data(call("/equities",cookie=cookie)).records("holdings").single().number("remainingShares"))
+    }
+    @Test fun `concurrent sales cannot oversell a purchase`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val pool=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val tasks=(1..2).map { pool.submit<Int> { call("/cash-ledger","POST",mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 600,"price" to 100),cookie).statusCode() } }
+            assertEquals(listOf(200,409),tasks.map { it.get(30,java.util.concurrent.TimeUnit.SECONDS) }.sorted())
+            assertEquals(400.0,data(call("/equities",cookie=cookie)).records("holdings").single().number("remainingShares"))
+        } finally { pool.shutdownNow() }
+    }
+
+    @Test fun `guest sale transfers after its purchase and retries retain one transaction`() {
+        val cookie=login();val source="guest:share:ledger-parent"
+        val purchase=call("/guest-migration/items","POST",guestItem(source,"equity",equity()),cookie)
+        assertEquals(200,purchase.statusCode(),purchase.body())
+        val target=data(purchase).text("targetId")
+        val sale=mapOf("kind" to "sale","parentSourceId" to source,"date" to "2026-10-01","currency" to "RWF","shares" to 250,"price" to 110,"fees" to 100)
+        val body=guestItem("guest:cash:ledger-sale","cash",sale)
+        val first=call("/guest-migration/items","POST",body,cookie)
+        assertEquals(200,first.statusCode(),first.body())
+        val retry=call("/guest-migration/items","POST",body,cookie)
+        assertEquals(200,retry.statusCode(),retry.body());assertEquals(data(first).text("targetId"),data(retry).text("targetId"))
+        assertEquals(1,data(call("/cash-ledger",cookie=cookie)).records("entries").size)
+        assertEquals(750.0,data(call("/equities",cookie=cookie)).records("holdings").single { it.text("id")==target }.number("remainingShares"))
+        assertEquals(409,call("/guest-migration/items","POST",guestItem("guest:cash:missing","cash",sale+mapOf("parentSourceId" to "guest:share:missing")),cookie).statusCode())
+    }
+    @Test fun `fully sold shares do not generate later price impact alerts`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        assertEquals(200,call("/cash-ledger","POST",mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 1000,"price" to 100),cookie).statusCode())
+        for((day,price) in listOf("2026-10-01" to 100,"2026-10-02" to 110)) history.record(mapOf("source" to mapOf("status" to "available","stale" to false,"publishedAt" to "${day}T12:00:00Z","checkedAt" to "${day}T13:00:00Z"),"quotes" to listOf(mapOf("ticker" to "IMR","closing" to price))))
+        assertEquals(0,notifications.collect("2026-10-02"))
+    }
+
 }

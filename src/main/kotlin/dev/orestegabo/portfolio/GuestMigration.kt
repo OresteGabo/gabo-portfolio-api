@@ -21,11 +21,11 @@ class GuestMigrationController(private val migration: GuestMigrationService) {
 
 @Service
 class GuestMigrationService(private val db: JdbcTemplate,private val json: JsonCodec,private val portfolio: PortfolioService,
-    private val validation: PurchaseValidation,private val documents: DocumentService) {
+    private val validation: PurchaseValidation,private val documents: DocumentService,private val ledger: InvestmentLedger) {
     private fun bind(owner: String,p: Record,keys: Set<String>) {
         checkApi(p.keys==keys && p["confirmed"]==true,"Review and confirm the selected guest data.")
         checkApi(p.text("accountId")==owner,"The signed-in account changed. Review the transfer again.",403)
-        checkApi(Regex("guest:(bond|share|receipt|document):[A-Za-z0-9-]{1,80}").matches(p.text("sourceId")),"Only personal guest records can be transferred.")
+        checkApi(Regex("guest:(bond|share|receipt|document|cash):[A-Za-z0-9-]{1,80}").matches(p.text("sourceId")),"Only personal guest records can be transferred.")
         lockAccount(db,owner)
     }
     private fun prior(owner: String,source: String,payload: Record): Record? = db.queryForList(
@@ -57,10 +57,26 @@ class GuestMigrationService(private val db: JdbcTemplate,private val json: JsonC
     @Transactional fun item(owner: String,p: Record): Record {
         bind(owner,p,setOf("accountId","sourceId","kind","record","documentIds","confirmed"))
         val kind=p.text("kind");val source=p.text("sourceId");val raw=p["record"].record()
-        checkApi(kind in listOf("bond","equity","receipt") && source.startsWith("guest:${if(kind=="equity")"share" else kind}:"),"Invalid transfer kind.")
+        checkApi(kind in listOf("bond","equity","receipt","cash") && source.startsWith("guest:${if(kind=="equity")"share" else kind}:"),"Invalid transfer kind.")
         val ids=p.strings("documentIds")
         checkApi(p["documentIds"] is List<*> && (p["documentIds"] as List<*>).size==ids.size && ids.size<=20 && ids.distinct().size==ids.size,"Invalid selected PDFs.")
         if(kind=="receipt") { checkApi(ids.isEmpty(),"Receipts do not accept PDF references."); return receipt(owner,source,raw) }
+        if(kind=="cash") {
+            checkApi(ids.isEmpty() && raw.keys.all { it in setOf("kind","date","currency","amount","shares","price","fees","tax","note","parentSourceId") },"Invalid cash transfer fields.")
+            val payload=mapOf("kind" to "cash","record" to raw)
+            prior(owner,source,payload)?.let { old ->
+                checkApi(ledger.entries(owner).any { it.text("id")==old.text("targetId") },"The transferred transaction was removed. Review it.",409)
+                return old+mapOf("status" to "already-transferred")
+            }
+            var record=raw.filterKeys { it!="parentSourceId" }+mapOf("id" to newId())
+            if(raw.text("kind") in listOf("sale","dividend")) {
+                val parent=db.queryForList("SELECT result FROM guest_migration_items WHERE owner_id=? AND source_id=? AND kind='equity'",owner,raw.text("parentSourceId")).singleOrNull()
+                    ?: throw ApiError(409,"Transfer this transaction's share purchase first.")
+                record=record+mapOf("holdingId" to json.read(parent["result"].toString()).text("targetId"))
+            }
+            val saved=ledger.save(owner,record)
+            return acknowledge(owner,source,"cash",payload,saved.text("id"),false)
+        }
         val data=normalized(kind,raw)
         val category=if(kind=="bond")"Bond confirmation" else "Share contract"
         val canonical=ids.map { documents.ownedEvidenceId(owner,it,category) ?: throw ApiError(400,"Selected private PDF was not found in this account.") }
