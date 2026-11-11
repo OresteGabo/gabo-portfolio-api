@@ -22,6 +22,9 @@ class GaboPortfolioApiApplicationTests {
     @LocalServerPort var port: Int=0
     @Autowired lateinit var db: JdbcTemplate
     @Autowired lateinit var json: JsonCodec
+    @Autowired lateinit var bidPortfolio: PortfolioService
+    @Autowired lateinit var formBids: BondApplicationBidService
+    @Autowired lateinit var applicationForms: BondApplicationForms
     @Autowired lateinit var auth: AuthService
     @Autowired lateinit var lifecycle: LifecycleNotifications
     @Autowired lateinit var notifications: PriceNotifications
@@ -44,7 +47,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @BeforeEach fun clean() {
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE investment_cash_ledger,bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE bond_live_activities,bond_month_reminders,investment_cash_ledger,bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -293,6 +296,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @Test fun `price changes alert only eligible holders once and unread data is isolated`() {
         val owner=login();val (uid,other)=user()
+        for(account in listOf("owner",uid)) lifecycle.update(account,mapOf("categories" to notificationCategories.associateWith { it=="prices" }))
         assertEquals(201,call("/equities","POST",equity(),owner).statusCode())
         assertEquals(201,call("/equities","POST",equity(),other).statusCode())
         fun close(day: String,price: Int)=history.record(mapOf("source" to mapOf("status" to "available","stale" to false,
@@ -1125,6 +1129,68 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(200,call("/cash-ledger","POST",mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 1000,"price" to 100),cookie).statusCode())
         for((day,price) in listOf("2026-10-01" to 100,"2026-10-02" to 110)) history.record(mapOf("source" to mapOf("status" to "available","stale" to false,"publishedAt" to "${day}T12:00:00Z","checkedAt" to "${day}T13:00:00Z"),"quotes" to listOf(mapOf("ticker" to "IMR","closing" to price))))
         assertEquals(0,notifications.collect("2026-10-02"))
+    }
+
+    private fun verifiedBidForm(): String {
+        val bytes=syntheticApplicationPdf()
+        val hash=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        return applicationForms.store(applicationForms.metadata("2026-11-5y-new"),hash,bytes).text("documentId")
+    }
+    @Test fun `form bids use extracted canonical fields and remain pending outside active totals`() {
+        val id=verifiedBidForm();val (owner,_)=user();val bidId=newId()
+        val saved=formBids.create(owner,id,mapOf("amount" to 1000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-01"))
+        assertEquals("FXD 6/2026/5YRS",saved.text("bondName"));assertEquals("2026-11-13",saved.text("settlementDate"));assertEquals("2031-11-07",saved.text("maturityDate"))
+        assertEquals("submitted",saved.text("status"));assertEquals(0.0,saved.number("couponRate"));assertEquals(0.0,saved.number("feesPaid"))
+        assertEquals(id,saved.text("applicationFormDocumentId"));assertEquals(1000000.0,saved.number("bidAmount"))
+        val overview=MobileOverview.create(listOf(saved),emptyList(),java.time.LocalDate.parse("2026-11-01"))
+        assertTrue(overview.records("purchases").any { it["id"]==saved["id"] })
+        val retry=formBids.create(owner,id,mapOf("amount" to 1000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-20"))
+        assertEquals(saved["id"],retry["id"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE owner_id=?",Int::class.java,owner))
+        assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to 2000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-02")) }
+    }
+    @Test fun `form bids are allowed before opening and on closing day but never after closing or before issuance month`() {
+        val id=verifiedBidForm();val (owner,_)=user()
+        for(day in listOf("2026-11-01","2026-11-08","2026-11-09","2026-11-11")) {
+            val amount=(day.takeLast(2).toInt()+1)*100000
+            assertEquals("submitted",formBids.create(owner,id,mapOf("amount" to amount,"bidId" to newId()),java.time.LocalDate.parse(day)).text("status"))
+        }
+        for(day in listOf("2026-10-31","2026-11-12","2027-11-01")) assertThrows(ApiError::class.java) {
+            formBids.create(owner,id,mapOf("amount" to 100000,"bidId" to newId()),java.time.LocalDate.parse(day))
+        }
+        assertEquals(4,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE owner_id=?",Int::class.java,owner))
+    }
+    @Test fun `form bids reject spoofed fields bad increments and unverified PDF metadata`() {
+        val id=verifiedBidForm();val (owner,_)=user();val day=java.time.LocalDate.parse("2026-11-01")
+        for(amount in listOf(-1,0,99999,150000)) assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to amount,"bidId" to newId()),day) }
+        assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to 100000,"bidId" to newId(),"status" to "active","settlementDate" to "2099-01-01"),day) }
+        assertThrows(ApiError::class.java) { formBids.create(owner,newId(),mapOf("amount" to 100000,"bidId" to newId()),day) }
+        assertEquals(401,call("/application-forms/$id/bids","POST",mapOf("amount" to 100000,"bidId" to newId())).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+    }
+    @Test fun `legacy stored forms extract terms once without duplicating the shared document`() {
+        val bytes=syntheticApplicationPdf();val id=newId()
+        db.update("INSERT INTO bond_application_forms(id,issue_key,sha256,content,metadata) VALUES(?::uuid,?,?,?,?::jsonb)",id,"legacy-key","synthetic-hash",Base64.getEncoder().encodeToString(bytes),json.write(applicationForms.metadata("2026-11-5y-new")))
+        val first=applicationForms.documents().single();assertEquals("FXD 6/2026/5YRS",first["bidTerms"].record().text("bondName"))
+        assertEquals(first,applicationForms.documents().single());assertFalse(first.containsKey("_bidParseVersion"))
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+    }
+
+    @Test fun `BNR results enrich a form bid and explicit confirmation retains its form and original amount`() {
+        val form=verifiedBidForm();val (owner,_)=user();val retry=newId()
+        val saved=formBids.create(owner,form,mapOf("amount" to 1000000,"bidId" to retry),java.time.LocalDate.parse("2026-11-01"))
+        val resultId=newId()
+        val terms=mapOf("issuanceDate" to "2026-11-11","bondName" to "FXD 6/2026/5YRS","isin" to "RW-SYNTHETIC-5Y","tenorYears" to 5,"settlementDate" to "2026-11-13","maturityDate" to "2031-11-07",
+            "couponRate" to .12,"pricePercent" to 100,"firstCouponDate" to "2027-05-07","couponDates" to listOf("2027-05-07","2031-11-07"),"couponFrequency" to 2,"scheduleConfidence" to "confirmed")
+        db.update("INSERT INTO bond_issuance_documents(id,issue_key,sha256,content,metadata) VALUES(?::uuid,?,?,?,?::jsonb)",resultId,"synthetic-5y-result","synthetic-result-hash",Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public result\n%%EOF".toByteArray()),json.write(mapOf("issuance" to terms)))
+        val enriched=bidPortfolio.bond(owner,saved.text("id"))!!
+        assertEquals("submitted",enriched.text("status"));assertEquals(.12,enriched.number("couponRate"));assertEquals(1000000.0,enriched.number("faceValue"))
+        assertEquals(form,enriched.text("applicationFormDocumentId"));assertEquals(resultId,enriched.text("issuanceDocumentId"))
+        val confirmed=bidPortfolio.confirmPending(owner,saved.text("id"),mapOf("confirmed" to true,"issuanceDocumentId" to resultId))
+        assertEquals("active",confirmed.text("status"));assertEquals("2026-11-11",confirmed.text("purchaseDate"));assertEquals(saved["id"],confirmed["id"]);assertEquals(form,confirmed.text("applicationFormDocumentId"))
+        db.update("UPDATE bond_purchases SET face_value=900000,amount_invested=900000 WHERE id=?::uuid",saved["id"])
+        val retried=formBids.create(owner,form,mapOf("amount" to 1000000,"bidId" to retry),java.time.LocalDate.parse("2026-11-20"))
+        assertEquals(saved["id"],retried["id"]);assertEquals(900000.0,retried.number("faceValue"));assertEquals(1000000.0,retried.number("bidAmount"))
     }
 
 }

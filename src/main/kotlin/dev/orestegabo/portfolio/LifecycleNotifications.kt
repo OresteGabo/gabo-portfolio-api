@@ -48,10 +48,10 @@ class LifecycleNotifications(private val db: JdbcTemplate,
                              private val portfolio: PortfolioService,
                              private val statements: StatementService,
                              private val notifications: PriceNotifications,
+                             private val bondReminders: BondReminders,
                              transactionManager: org.springframework.transaction.PlatformTransactionManager)
 {
     private val dailyTransactions=org.springframework.transaction.support.TransactionTemplate(transactionManager)
-    private val calendar=javaClass.getResourceAsStream("/issuance-calendar.json")!!.bufferedReader().use { json.list(it.readText()) }
     fun preferences(owner: String): Record {
         val row=db.queryForList("SELECT categories,auto_coupon,monthly_target FROM notification_preferences WHERE owner_id=?",owner).firstOrNull()
         return mapOf("configured" to (row!=null),"categories" to notificationCategories.associateWith { row?.get("categories")?.toString()?.let(json::read)?.get(it) ?: true },
@@ -111,12 +111,7 @@ class LifecycleNotifications(private val db: JdbcTemplate,
             date(p.text("maturityDate"))?.takeIf { it>=today && it<=today.plusDays(30) }?.let {
                 event("maturities","maturity:$id",mapOf("title" to title,"purchaseId" to id,"dueDate" to it.toString(),"amount" to p["faceValue"],"currency" to p["currency"],"action" to "calendar")) }
         }
-        for(issue in calendar) {
-            val open=date(issue.text("openBookDate"));val close=date(issue.text("closingBookDate"))
-            if(open==null || close==null || today<open || today>close)continue
-            val closing=today>=close.minusDays(1)
-            event("subscriptions","subscription:${issue.text("id")}:${if(closing)"close" else "open"}",mapOf("title" to issue["title"],"stage" to if(closing)"closing" else "open","dueDate" to close.toString(),"action" to "calendar"))
-        }
+        bondReminders.sync(owner,today)
         val missing=statements.missing(owner)
         for(item in missing)event("documents","missing:${item.text("id")}",mapOf("statementId" to item["id"],"title" to item["title"],"action" to "documents"))
         db.update("""UPDATE notifications SET payload=payload||'{"resolved":true}'::jsonb,read_at=COALESCE(read_at,now())

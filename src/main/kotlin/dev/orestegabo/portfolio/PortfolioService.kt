@@ -17,7 +17,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         pending.refresh(owner)
         val publicEvidence = db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it.text("id") to json.read(it["metadata"].toString())["issuance"].record() }
         return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata,COALESCE(c.legacy_id,c.id::text,p.confirmation_document_id::text) AS confirmation_reference FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id LEFT JOIN bond_uploaded_documents c ON c.id=p.confirmation_document_id AND c.owner_id=p.owner_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
-            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"statementDocumentId" to row["statement_document_id"]?.toString())
+            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"applicationFormDocumentId" to row["application_form_id"]?.toString(),"bidId" to row["client_bid_id"]?.toString(),"bidAmount" to row["bid_amount"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
                 "couponDates" -> json.mapper.readValue(row[column(key)].toString(),List::class.java)
                 in dates -> row[column(key)]?.toString() ?: ""
@@ -126,7 +126,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
 }
 
 object MobileOverview {
-    fun create(bonds: List<Record>,shares: List<Record>,today: LocalDate = LocalDate.now(ZoneOffset.UTC)): Record {
+    fun create(bonds: List<Record>,shares: List<Record>,today: LocalDate = notificationToday()): Record {
         val from=today.minusYears(1).toString(); val through=today.toString()
         fun recent(rows: List<Record>,key: String)=rows.filter { it.text(key) in from..through }.sortedWith(compareByDescending<Record> { it.text(key) }.thenByDescending { it.text("createdAt") }.thenBy { it.text("id") }).take(12)
         val rb=recent(bonds,"purchaseDate"); val rs=recent(shares,"tradeDate")

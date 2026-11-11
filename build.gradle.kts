@@ -37,6 +37,7 @@ dependencies {
     implementation("org.flywaydb:flyway-database-postgresql")
     implementation("org.jetbrains.kotlin:kotlin-reflect")
     implementation("org.bouncycastle:bcprov-jdk18on:1.85.2")
+    implementation("org.apache.pdfbox:pdfbox:3.0.8")
     implementation("org.jsoup:jsoup:1.23.2")
     implementation("tools.jackson.module:jackson-module-kotlin")
     developmentOnly("org.springframework.boot:spring-boot-devtools")

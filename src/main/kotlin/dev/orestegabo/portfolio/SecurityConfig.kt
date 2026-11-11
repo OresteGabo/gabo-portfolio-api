@@ -47,6 +47,7 @@ class SecurityConfig(
             .formLogin { it.disable() }.httpBasic { it.disable() }.logout { it.disable() }
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
             .authorizeHttpRequests {
+                it.requestMatchers("/api/bonds/notifications/bond-reminders/dispatch").permitAll()
                 it.requestMatchers("/actuator/health", "/api/bonds/auth/session", "/api/bonds/auth/login", "/api/bonds/auth/register", "/api/bonds/rse/**").permitAll()
                     .requestMatchers("/api/bonds/**").authenticated().anyRequest().denyAll()
             }
