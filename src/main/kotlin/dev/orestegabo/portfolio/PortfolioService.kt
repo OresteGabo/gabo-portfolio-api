@@ -109,11 +109,6 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         db.update("INSERT INTO equity_purchases(id,owner_id,dedup_key,contract_key,report_key,holding) VALUES (?::uuid,?,?,?,?,?::jsonb)",p["id"],owner,validation.equityKey(p),contract,p.text("tradeReportId").ifBlank { null },json.write(p))
         return p
     }
-    // Preserve optional notes/source fields; every normalized financial/identity field must agree.
-    private fun sameFinancialRecord(a: Record,b: Record): Boolean = (a.keys+b.keys).filterNot { it in setOf("notes","sourceUrl","accountReference") }.all { key ->
-        val x=a[key]; val y=b[key]
-        if(x is Number && y is Number) x.toString().toBigDecimal().compareTo(y.toString().toBigDecimal())==0 else x==y
-    }
     fun accounts(owner: Account,friend: Account?): List<Record> {
         val accounts = mutableListOf<Record>(mapOf("id" to owner.id,"email" to owner.email,"createdAt" to null,"status" to "active","kind" to "owner","deletable" to false))
         friend?.let { accounts+=mapOf("id" to it.id,"email" to it.email,"createdAt" to null,"status" to "active","kind" to "environment","deletable" to false) }

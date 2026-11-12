@@ -674,6 +674,26 @@ class GaboPortfolioApiApplicationTests {
         assertFalse(json.write(resolved).contains("SECRET"))
     }
 
+    @Test fun `scanned duplicate proof preserves confirmed schedule and existing financial record`() {
+        val (_,cookie)=user()
+        val dates=listOf("2027-04-23","2027-10-23","2031-10-23")
+        val input=bond("active")+mapOf("couponDates" to dates,"firstCouponDate" to dates.first(),"scheduleConfidence" to "confirmed")
+        val original=data(call("/purchases","POST",input,cookie))["purchase"].record()
+        val proof=data(upload(cookie)).text("documentId")
+        repeat(2) {
+            val response=call("/purchases","POST",input+mapOf("scheduleConfidence" to "estimated","confirmationDocumentId" to proof),cookie)
+            assertEquals(201,response.statusCode(),response.body())
+            val saved=data(response)["purchase"].record()
+            assertEquals(original["id"],saved["id"])
+            assertEquals("confirmed",saved["scheduleConfidence"])
+            assertEquals(original["faceValue"],saved["faceValue"])
+            assertEquals(original["couponDates"],saved["couponDates"])
+            assertEquals(proof,saved["confirmationDocumentId"])
+        }
+        assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
+        assertEquals(409,call("/purchases","POST",input+mapOf("scheduleConfidence" to "estimated","confirmationDocumentId" to proof,"feesPaid" to 12000),cookie).statusCode())
+    }
+
     @Test fun `legacy investments gain owned evidence without duplicates or financial changes`() {
         val (_,a)=user(); val (_,b)=user()
         val original=data(call("/purchases","POST",bond("active"),a))["purchase"].record()
