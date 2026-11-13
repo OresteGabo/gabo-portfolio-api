@@ -70,7 +70,7 @@ class SecurityConfig(
                                 request.requestURI == "/api/bonds/guest-migration/items" -> 65536
                                 request.requestURI == "/api/bonds/statement-items" -> 131072
                                 request.requestURI.startsWith("/api/bonds/purchases") -> 32768
-                                request.requestURI == "/api/bonds/equities" -> 16384
+                                request.requestURI == "/api/bonds/equities" || request.requestURI.startsWith("/api/bonds/share-orders/") -> 16384
                                 else -> 4096
                             }
                             checkApi(request.contentLengthLong <= limit, "Request body is too large.", 413)
