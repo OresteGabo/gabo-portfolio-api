@@ -25,7 +25,7 @@ To verify owner login interactively, run `python3 scripts/check-login.py`. Enter
 
 See [docs/API.md](docs/API.md) for the route inventory. Clients must send `Origin` on mutations, `Content-Type: application/json` for JSON bodies and the session cookie returned by login. Private responses use `Cache-Control: private, no-store`.
 
-Local HTTP uses profile `local` and `bonds_session_v2`; production defaults to HTTPS-only `__Host-bonds_session`. Cookies are HttpOnly and SameSite=Strict. Add exact website and API origins to `GABO_ALLOWED_ORIGINS`, for example `https://bonds.orestegabo.dev,https://api.orestegabo.dev`. The mobile app sends its configured server origin. No wildcard CORS is used. The website and API should share the same site for Strict cookies, or use a same-origin website proxy.
+Local HTTP uses profile `local` and `bonds_session_v2`; production defaults to HTTPS-only `__Host-bonds_session`. Cookies are HttpOnly and SameSite=Strict. Add exact website and API origins to `GABO_ALLOWED_ORIGINS`, for example `https://invest.orestegabo.dev,https://bonds.orestegabo.dev,https://gabo-portfolio-api-639858675564.europe-west1.run.app`. The mobile app sends its configured server origin. No wildcard CORS is used. The website and API should share the same site for Strict cookies, or use a same-origin website proxy.
 
 Changing the API hostname requires signing in again: host-only cookies do not move between hosts. Existing database session rows are compatible, but stateless JSON-mode owner sessions are not.
 
@@ -51,3 +51,5 @@ See [docs/MIGRATION.md](docs/MIGRATION.md). Never point a test run or initial de
 ## Security audit follow-up
 
 The 30 October 2026 local audit adds account-scoped contract-price history, owner-only shared issuance publication, atomic scheduled receipt/reminder work, PDF envelope validation and targeted dependency patches. See [API boundaries](docs/API.md) and the companion KMP checkout's `docs/security/SECURITY_AUDIT.md`, `DEPENDENCIES.md`, `OPERATIONS.md` and `RWANDA_DATA_PROTECTION.md`. These are tested local changes, not proof of a production deployment, restore exercise or legal compliance.
+
+Investment-domain rollout and current backend origin configuration: [docs/INVEST_DOMAIN.md](docs/INVEST_DOMAIN.md).
