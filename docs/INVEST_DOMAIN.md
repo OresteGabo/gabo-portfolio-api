@@ -1,6 +1,6 @@
 # Investment website domain — 14 November 2026
 
-The investment frontend is being migrated to `https://invest.orestegabo.dev`. Its source is independent of the CV, in `WebstormProjects/gabo-portfolio`. The old `https://bonds.orestegabo.dev` remains an allowed origin for existing mobile/web clients during migration.
+The investment frontend is live at `https://invest.orestegabo.dev`. Its source is independent of the CV, in `WebstormProjects/gabo-portfolio`. The old `https://bonds.orestegabo.dev` remains an allowed origin for existing mobile/web clients during migration.
 
 ## Backend rollout completed
 
@@ -18,6 +18,6 @@ The candidate was first deployed with no production traffic, then checked at `/a
 
 ## Frontend and client requirements
 
-The website still proxies `/api/bonds/*` to the same backend; no API endpoint rename is needed. Vercel project `gabo-portfolio` owns the new frontend deployment. DNS and the encrypted cron credential must be configured there before completing the frontend cutover. The exact website deployment and domain status are documented in the frontend repository's `BONDS_DEPLOYMENT.md`.
+The website still proxies `/api/bonds/*` to the same backend; no API endpoint rename is needed. Vercel project `gabo-portfolio` owns the new frontend deployment. DNS and the encrypted cron credential were configured on 14 November 2026; the production frontend cutover is complete. The old bonds hostname redirects to invest while both origins remain accepted by this backend. The exact website deployment and domain status are documented in the frontend repository's `BONDS_DEPLOYMENT.md`.
 
 The website's domain rename does not change the mobile app binary or its configured server. Keep the old origin allowed until existing clients have migrated. Cookies and browser localStorage do not automatically transfer between subdomains; users can sign in to the same account at the new website once it is live. Keep exact origin matching; do not widen the cookie domain or add wildcard CORS to make the migration work.
