@@ -32,3 +32,7 @@ Build and publish a new linux/amd64 container to the Portfolio Artifact Registry
 Keep `BONDS_API_ORIGIN` in Vercel Production. The website's legacy database settings remain for rollback, but normal `/api/bonds/*` traffic is handled by Spring. Do not write independently to the old database after cutover. The original website deployment and database are retained as rollback references; a rollback after new writes requires reconciling those writes.
 
 Minimum instances zero and small limits reduce ongoing costs, but do not guarantee a zero bill. No Kaze service or billing configuration was changed.
+
+## Application form retention activated — 17 November 2026
+
+Production now serves `gabo-portfolio-api-retention-ed6b71e` at 100% traffic, built from `ed6b71e` on `feature/guest-mode`. Flyway V19 applied successfully. Public health and an authenticated daily run passed; cleanup completed with zero deletions. The existing daily scheduler now runs the 30-day blank-form policy, retaining unresolved applications and preserving purchases, confirmations and public results. Existing configuration, secrets and scaling were retained. See [retention rollout verification](APPLICATION_FORM_RETENTION.md#production-activation--17-november-2026).

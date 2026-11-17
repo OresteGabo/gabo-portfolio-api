@@ -20,7 +20,7 @@ Cleanup is transactional. A short `SHARE ROW EXCLUSIVE` lock on `bond_purchases`
 
 ## Operations and rollout
 
-Deploy the updated backend with Flyway enabled. V19 must succeed before serving the new code. Existing eligible forms can be deleted on the first subsequent authenticated daily run. No live cleanup or deployment is performed by adding this source change.
+Deploy the updated backend with Flyway enabled. V19 must succeed before serving the new code. Existing eligible forms can be deleted on the first subsequent authenticated daily run. The production activation and verification are recorded below.
 
 The daily response includes `applicationFormCleanup: {status: "completed", deleted: N}` or `{status: "failed"}`. Cleanup failures are logged and make the daily response HTTP 503 even if market collection succeeds, allowing the scheduler to retry. Existing market collection failures still return 503 independently. Unauthorized requests cannot start cleanup.
 
@@ -37,3 +37,15 @@ JAVA_TOOL_OPTIONS='-Dstruct.test.local-postgres=true -Dstruct.test.database-url=
 GABO_DATABASE_URL='jdbc:postgresql://127.0.0.1:55486/struct_test_form_retention' \
 GABO_DATABASE_USER=struct_test GABO_DATABASE_PASSWORD= ./gradlew test bootJar --console=plain
 ```
+
+## Production activation — 17 November 2026
+
+- Runtime source commit: `ed6b71ec2adb73b5567a7393b4dd315a641c967f` on `feature/guest-mode`, which contains the guest, application-bid and pending-share features already used in production. The older `main` branch was not substituted for that runtime source.
+- Linux amd64 image: `europe-west1-docker.pkg.dev/gabo-portfolio-api/portfolio/api@sha256:49643cd2ef5ce648db45115c9bc096ad9e75a3c1f9762e37b5fbaa583f28c0cf`.
+- Cloud Run revision: `gabo-portfolio-api-retention-ed6b71e`, project `gabo-portfolio-api`, region `europe-west1`.
+- Candidate started with no production traffic. Its health was `UP`; Flyway logs confirmed V19 applied successfully. Runtime/secret-reference configuration and scaling were compared with the prior revision and remained unchanged.
+- Promoted to 100% production traffic, removed the temporary review tag, and verified the public API health remained `UP`. The existing Firebase setup tag was retained.
+- One authenticated production daily run returned HTTP 200, market status `saved`, and `applicationFormCleanup: {status: "completed", deleted: 0}`. The policy is active; no form was eligible/deleted in that verification run.
+- Existing scheduled daily requests were independently observed in production logs on 15 and 16 November. No additional scheduler or secret was created; subsequent calls to the same daily route run the cleanup automatically.
+
+The candidate was built locally with Docker because Cloud Build was disabled in this project. No Cloud Build API was enabled. Production credentials were used only through the existing secret reference to verify the authenticated daily route; they were not printed or committed.
