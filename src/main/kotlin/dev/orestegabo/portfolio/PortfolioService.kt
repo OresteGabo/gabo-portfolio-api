@@ -92,17 +92,25 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     @Transactional fun saveShare(owner: String,raw: Record,preserveNotes: Boolean = false): Record {
         lockAccount(db,owner)
         val documentId=raw.text("contractDocumentId").takeIf(String::isNotBlank)
-        if(documentId!=null)checkApi(uuid(documentId) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE owner_id=? AND id=?::uuid AND metadata->>'category'='Share contract'",owner,documentId).isNotEmpty(),"Share contract PDF not found.")
+        val canonicalDocument=if(documentId==null)null else (documents.ownedEvidenceId(owner,documentId,"Share contract")
+            ?: throw ApiError(400,"Share contract PDF not found."))
         val p = validation.equity(raw)+(if(preserveNotes)mapOf("notes" to raw.text("notes").trim().also { checkApi(it.length<=1000,"Notes are too long.") }) else emptyMap())+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
         if(documentId!=null) {
-            val candidates=shares(owner).filter { validation.equityKey(it)==validation.equityKey(p) }
+            // The public holding ID can predate UUID-backed storage. Select the real
+            // database row explicitly, and preserve the original holding JSON on attachment.
+            val candidates=db.query("SELECT id::text,holding FROM equity_purchases WHERE owner_id=?", { row,_ ->
+                row.getString(1) to json.read(row.getString(2))
+            },owner).filter { validation.equityKey(it.second)==validation.equityKey(p) }
             checkApi(candidates.size<=1,"Multiple matching purchases require review.",409)
-            candidates.singleOrNull()?.let { existing ->
+            candidates.singleOrNull()?.let { (databaseId,existing) ->
                 checkApi(sameFinancialRecord(validation.equity(existing),validation.equity(p)),"The saved purchase differs from this PDF. Review it before attaching evidence.",409)
-                checkApi(existing.text("contractDocumentId").isBlank() || existing.text("contractDocumentId")==documentId,"This purchase already has another contract PDF.",409)
-                val linked=existing+mapOf("contractDocumentId" to documentId)
-                db.update("UPDATE equity_purchases SET holding=?::jsonb WHERE owner_id=? AND id=?::uuid",json.write(linked),owner,existing["id"])
-                return linked
+                val existingDocument=existing.text("contractDocumentId")
+                checkApi(existingDocument.isBlank() || documents.ownedEvidenceId(owner,existingDocument,"Share contract")==canonicalDocument,
+                    "This purchase already has another contract PDF.",409)
+                // Retain an established public alias so the Library metadata and download link agree.
+                val linked=existing+mapOf("contractDocumentId" to existingDocument.ifBlank { documentId })
+                db.update("UPDATE equity_purchases SET holding=?::jsonb WHERE owner_id=? AND id=?::uuid",json.write(linked),owner,databaseId)
+                return shares(owner).single { validation.equityKey(it)==validation.equityKey(p) }
             }
         }
         val contract = p.text("contractNote").takeIf { it.isNotBlank() }?.let { "${normalized(p.text("broker"))}|${normalized(it)}" }

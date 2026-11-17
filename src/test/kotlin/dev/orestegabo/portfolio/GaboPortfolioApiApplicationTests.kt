@@ -1377,4 +1377,64 @@ class GaboPortfolioApiApplicationTests {
         } finally { marketTestPages.fail=false }
     }
 
+
+    private fun shareEvidence(cookie: String, name: String): String {
+        val response=call("/documents","POST",mapOf("uploadId" to newId().replace("-",""),"index" to 0,"count" to 1,
+            "content" to Base64.getEncoder().encodeToString("%PDF-1.7 synthetic $name contract\n%%EOF".toByteArray()),
+            "metadata" to mapOf("category" to "Share contract","documentDate" to "2026-09-24","label" to "Synthetic share contract","instrumentName" to "Synthetic security","issuer" to "BK Capital")),cookie)
+        assertEquals(200,response.statusCode(),response.body())
+        return data(response).text("documentId")
+    }
+
+    @Test fun `share evidence attaches to a legacy public lot id without changing the purchase or sale balances`() {
+        val (owner,cookie)=user()
+        val created=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val databaseId=created.text("id")
+        val legacyId="legacy-share-lot-synthetic"
+        val original=created+mapOf("id" to legacyId,"notes" to "Retain original imported note","legacyTag" to "synthetic provenance")
+        db.update("UPDATE equity_purchases SET holding=?::jsonb WHERE id=?::uuid AND owner_id=?",json.write(original),databaseId,owner)
+        db.update("INSERT INTO investment_cash_ledger(id,owner_id,payload) VALUES(?::uuid,?,?::jsonb)",newId(),owner,
+            json.write(mapOf("kind" to "sale","holdingId" to databaseId,"shares" to 100,"allocatedCost" to 9110)))
+        val document=shareEvidence(cookie,"legacy lot")
+        val sourceBefore=db.queryForObject("SELECT content FROM bond_uploaded_documents WHERE id=?::uuid",String::class.java,document)
+        repeat(2) {
+            val response=call("/equities","POST",equity()+mapOf("contractDocumentId" to document),cookie)
+            assertEquals(201,response.statusCode(),response.body())
+            val linked=data(response)["holding"].record()
+            assertEquals(legacyId,linked["id"]);assertEquals(created["createdAt"],linked["createdAt"])
+            assertEquals(document,linked["contractDocumentId"])
+            assertEquals(900.0,linked.number("remainingShares"));assertEquals(81990.0,linked.number("remainingCost"))
+        }
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM equity_purchases WHERE owner_id=?",Int::class.java,owner))
+        assertEquals(true,db.queryForObject("SELECT holding-'contractDocumentId'=?::jsonb FROM equity_purchases WHERE id=?::uuid",Boolean::class.java,json.write(original),databaseId))
+        assertEquals(sourceBefore,db.queryForObject("SELECT content FROM bond_uploaded_documents WHERE id=?::uuid",String::class.java,document))
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM investment_cash_ledger WHERE owner_id=?",Int::class.java,owner))
+    }
+
+    @Test fun `share evidence resolves owner scoped legacy PDF references and preserves the library alias`() {
+        val (owner,cookie)=user();val (_,other)=user()
+        val created=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val databaseDocument=shareEvidence(cookie,"legacy PDF")
+        val reference="legacy-share-contract-synthetic"
+        db.update("UPDATE bond_uploaded_documents SET legacy_id=?,metadata=jsonb_set(metadata,'{category}','\"Equity contract\"'::jsonb) WHERE id=?::uuid AND owner_id=?",reference,databaseDocument,owner)
+        assertTrue(data(call("/documents",cookie=cookie)).records("documents").any { it.text("id")==reference })
+        for (incoming in listOf(reference,databaseDocument,reference)) {
+            val response=call("/equities","POST",equity()+mapOf("contractDocumentId" to incoming),cookie)
+            assertEquals(201,response.statusCode(),response.body())
+            val linked=data(response)["holding"].record()
+            assertEquals(created["id"],linked["id"]);assertEquals(created["createdAt"],linked["createdAt"])
+            assertEquals(reference,linked["contractDocumentId"])
+        }
+        assertEquals(200,call("/documents/$reference",cookie=cookie).statusCode())
+        assertEquals(400,call("/equities","POST",equity()+mapOf("contractDocumentId" to reference),other).statusCode())
+        assertTrue(data(call("/equities",cookie=other)).records("holdings").isEmpty())
+        val unrelated=shareEvidence(cookie,"different PDF")
+        assertEquals(409,call("/equities","POST",equity()+mapOf("contractDocumentId" to unrelated),cookie).statusCode())
+        val bondProof=data(upload(cookie)).text("documentId")
+        assertEquals(400,call("/equities","POST",equity()+mapOf("contractDocumentId" to bondProof),cookie).statusCode())
+        assertEquals(409,call("/equities","POST",equity()+mapOf("contractDocumentId" to reference,"broker" to "Different broker"),cookie).statusCode())
+        assertEquals(1,data(call("/equities",cookie=cookie)).records("holdings").size)
+        assertEquals(reference,data(call("/equities",cookie=cookie)).records("holdings").single()["contractDocumentId"])
+    }
+
 }

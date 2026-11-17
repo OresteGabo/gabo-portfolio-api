@@ -110,3 +110,9 @@ V18 adds only the separate share_orders table/index. No holding, valuation, mark
 ## Shared application form retention
 
 The existing authenticated daily job deletes only shared blank forms 30 elapsed days after matching results were first published in this service. Any linked or matching primary application still marked `submitted`, across any account, postpones deletion. Purchases and confirmations remain; expired document links are cleared while original bid identities remain retryable. The daily response adds `applicationFormCleanup` status/count and returns 503 on cleanup failure. See [retention policy and rollout](APPLICATION_FORM_RETENTION.md).
+
+## Reattaching saved share contracts
+
+Reuploading a previously stored contract can link it to the matching existing share purchase without creating another purchase or PDF. Evidence references are resolved within the current account through both canonical document UUIDs and preserved Library aliases; migrated `Equity contract` documents are accepted only when they retain a legacy ID. Other accounts' documents and non-contract categories remain rejected.
+
+Matching still requires the full saved trade identity and financial record. The actual database row UUID is used for updates; a migrated public holding ID is not cast to UUID. Attachment changes only `contractDocumentId` in the stored holding JSON, retaining the original public ID, creation time, notes, metadata and financial fields. Current sale/remaining balances are calculated for the response rather than copied into the stored purchase. Repeated attachment of the same PDF, including through its canonical ID or public alias, is idempotent. A different existing contract or financial discrepancy still requires review.
