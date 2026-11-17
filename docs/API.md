@@ -31,7 +31,7 @@ All paths below are prefixed with `/api/bonds`. JSON errors expose a short `erro
 | GET | `/rse/market?refresh=1` | Public cached bond market/scores; authenticated callers may force refresh |
 | GET | `/rse/quotes?kind=equities` | Public cached `bonds` or `equities`; authenticated callers may force `refresh=1` |
 | GET | `/rse/equity-history?tickers=IMR,BOK&period=year` | Public official observations; authenticated callers additionally receive only their own account’s contract-price evidence; up to ten symbols and month/year/all |
-| GET | `/rse/daily` | Scheduler bearer secret; fresh collection and bounded run status |
+| GET | `/rse/daily` | Scheduler bearer secret; expired shared blank-form cleanup, fresh collection and bounded run status |
 | GET | `/rse/snapshot` | Snapshot bearer secret; refresh bond data and return counts |
 
 The complete history routes retain their existing unpaginated contract because exports and See all depend on it. The mobile overview limits previews to twelve per asset class from the previous year without dropping older holdings from totals or schedules.
@@ -97,3 +97,16 @@ Public sources never confirm personal allocation. Full policy, explicit beta tru
 ## Security coupon projection — 1 November 2026
 
 `GET /coupon-terms` is authenticated and returns the public security-only allowlist described in [PRIVATE_COUPON_TERMS.md](PRIVATE_COUPON_TERMS.md). A saved private confirmation may contribute rates/explicit coupon dates, but no private file or investor/source/amount/acquisition metadata becomes shared. Source priority/conflict handling is explicit; no automatic personal allocation confirmation or historical financial rewrite. Deploy additive migration V10 before the corresponding mobile build.
+
+
+## Pending share orders
+
+Authenticated, owner-scoped order requests are separate from executed equities. GET `/api/bonds/share-orders` lists pending requests only. PUT `/api/bonds/share-orders/{clientUuid}` creates/edits a request with `version` (0 on creation), ticker/securityName, positive whole shares, pricePerShare (up to two decimals), requestDate, optional expectedExecutionDate, broker, brokerConfirmed and notes. The server recomputes gross consideration, the fixed 1.71% estimated commission and estimated payable using decimal HALF_UP arithmetic; client totals/rates are ignored. A stale version returns 409. Maximum 200 open requests per owner.
+
+POST `/{id}/cancel` accepts the current version and closes the app record only; it never contacts a broker. POST `/{id}/confirm` accepts `{confirmed:true,version,purchase}` with the existing executed-equity payload. It requires the same ticker and full requested quantity, validates actual contract-note data, creates the purchase and closes the order atomically under the existing account lock. A retry returns the originally linked purchase. Cancelled/executed requests cannot be edited back into pending requests. Partial fills require explicit review/adjustment first.
+
+V18 adds only the separate share_orders table/index. No holding, valuation, market-history or contribution query reads order requests. Account deletion removes their records. Tests use synthetic owner IDs and a disposable loopback PostgreSQL cluster; no production order is created during verification.
+
+## Shared application form retention
+
+The existing authenticated daily job deletes only shared blank forms 30 elapsed days after matching results were first published in this service. Any linked or matching primary application still marked `submitted`, across any account, postpones deletion. Purchases and confirmations remain; expired document links are cleared while original bid identities remain retryable. The daily response adds `applicationFormCleanup` status/count and returns 503 on cleanup failure. See [retention policy and rollout](APPLICATION_FORM_RETENTION.md).

@@ -25,7 +25,7 @@ To verify owner login interactively, run `python3 scripts/check-login.py`. Enter
 
 See [docs/API.md](docs/API.md) for the route inventory. Clients must send `Origin` on mutations, `Content-Type: application/json` for JSON bodies and the session cookie returned by login. Private responses use `Cache-Control: private, no-store`.
 
-Local HTTP uses profile `local` and `bonds_session_v2`; production defaults to HTTPS-only `__Host-bonds_session`. Cookies are HttpOnly and SameSite=Strict. Add exact website and API origins to `GABO_ALLOWED_ORIGINS`, for example `https://bonds.orestegabo.dev,https://api.orestegabo.dev`. The mobile app sends its configured server origin. No wildcard CORS is used. The website and API should share the same site for Strict cookies, or use a same-origin website proxy.
+Local HTTP uses profile `local` and `bonds_session_v2`; production defaults to HTTPS-only `__Host-bonds_session`. Cookies are HttpOnly and SameSite=Strict. Add exact website and API origins to `GABO_ALLOWED_ORIGINS`, for example `https://invest.orestegabo.dev,https://bonds.orestegabo.dev,https://gabo-portfolio-api-639858675564.europe-west1.run.app`. The mobile app sends its configured server origin. No wildcard CORS is used. The website and API should share the same site for Strict cookies, or use a same-origin website proxy.
 
 Changing the API hostname requires signing in again: host-only cookies do not move between hosts. Existing database session rows are compatible, but stateless JSON-mode owner sessions are not.
 
@@ -42,7 +42,7 @@ See [docs/MIGRATION.md](docs/MIGRATION.md). Never point a test run or initial de
 - Set the owner email/hash and allowlisted origins. Leave `GABO_COOKIE_SECURE=true` in production.
 - The API does not trust arbitrary forwarding headers for rate limiting. Configure a trusted reverse proxy and Spring/Tomcat forwarding handling deliberately if deploying multiple users behind it.
 - Expose only health publicly. Actuator internals, account data and PDFs are not public endpoints. Do not log request bodies or cookies at the proxy.
-- Schedule a daily authenticated GET to `/api/bonds/rse/daily` with `Authorization: Bearer <CRON_SECRET>`. Vercel's existing cron will not automatically run on a new host. Snapshot uses a separate `BONDS_MARKET_SNAPSHOT_SECRET`.
+- Schedule a daily authenticated GET to `/api/bonds/rse/daily` with `Authorization: Bearer <CRON_SECRET>`. Vercel's existing cron will not automatically run on a new host. Snapshot uses a separate `BONDS_MARKET_SNAPSHOT_SECRET`. This daily job also deletes eligible shared blank application forms after 30 days, retaining unresolved applications and all purchases/confirmations; see [retention policy](docs/APPLICATION_FORM_RETENTION.md).
 - RSE reads use fixed upstream URLs, request/body limits and short timeouts. Quotes are cached for fifteen minutes; failures can use a clearly marked stale quote for up to one day. Missing historical dates stay missing; contract execution prices remain distinct from official closing prices.
 - Private PDFs currently remain in PostgreSQL, matching the website. Plan database capacity and private backups; object storage can be added later without changing client URLs.
 - Choose and document the actual storage locations, backups and hosting providers before processing invited users' data in the new deployment.
@@ -51,3 +51,5 @@ See [docs/MIGRATION.md](docs/MIGRATION.md). Never point a test run or initial de
 ## Security audit follow-up
 
 The 30 October 2026 local audit adds account-scoped contract-price history, owner-only shared issuance publication, atomic scheduled receipt/reminder work, PDF envelope validation and targeted dependency patches. See [API boundaries](docs/API.md) and the companion KMP checkout's `docs/security/SECURITY_AUDIT.md`, `DEPENDENCIES.md`, `OPERATIONS.md` and `RWANDA_DATA_PROTECTION.md`. These are tested local changes, not proof of a production deployment, restore exercise or legal compliance.
+
+Investment-domain rollout and current backend origin configuration: [docs/INVEST_DOMAIN.md](docs/INVEST_DOMAIN.md).

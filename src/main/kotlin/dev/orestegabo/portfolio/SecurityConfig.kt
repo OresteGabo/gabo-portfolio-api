@@ -47,6 +47,7 @@ class SecurityConfig(
             .formLogin { it.disable() }.httpBasic { it.disable() }.logout { it.disable() }
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
             .authorizeHttpRequests {
+                it.requestMatchers("/api/bonds/notifications/bond-reminders/dispatch").permitAll()
                 it.requestMatchers("/actuator/health", "/api/bonds/auth/session", "/api/bonds/auth/login", "/api/bonds/auth/register", "/api/bonds/rse/**").permitAll()
                     .requestMatchers("/api/bonds/**").authenticated().anyRequest().denyAll()
             }
@@ -65,10 +66,11 @@ class SecurityConfig(
                             val origin = request.getHeader("Origin")
                             checkApi(origin != null && runCatching { URI(origin).let { it.scheme + "://" + it.rawAuthority } }.getOrNull() in origins, "Invalid request origin.", 403)
                             val limit = when {
-                                request.requestURI == "/api/bonds/documents" -> 710000
+                                request.requestURI in listOf("/api/bonds/documents", "/api/bonds/guest-migration/documents") -> 710000
+                                request.requestURI == "/api/bonds/guest-migration/items" -> 65536
                                 request.requestURI == "/api/bonds/statement-items" -> 131072
                                 request.requestURI.startsWith("/api/bonds/purchases") -> 32768
-                                request.requestURI == "/api/bonds/equities" -> 16384
+                                request.requestURI == "/api/bonds/equities" || request.requestURI.startsWith("/api/bonds/share-orders/") -> 16384
                                 else -> 4096
                             }
                             checkApi(request.contentLengthLong <= limit, "Request body is too large.", 413)

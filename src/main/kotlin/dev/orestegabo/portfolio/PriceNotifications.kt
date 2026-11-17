@@ -19,15 +19,18 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
                 WHERE ticker=q.ticker AND observed_date<q.observed_date ORDER BY observed_date DESC LIMIT 1
             ) p ON true WHERE q.observed_date=?::date AND q.closing_price<>p.closing_price
         ), positions AS (
-            SELECT owner_id,holding->>'ticker' ticker,sum((holding->>'shares')::numeric) shares,
-                sum((holding->>'netAmountPayable')::numeric) cash_cost
-            FROM equity_purchases WHERE holding->>'status'='active' AND holding->>'currency'='RWF'
+            SELECT owner_id,holding->>'ticker' ticker,sum((holding->>'shares')::numeric-COALESCE(s.sold,0)) shares,
+                sum((holding->>'netAmountPayable')::numeric-COALESCE(s.cost,0)) cash_cost
+            FROM equity_purchases e LEFT JOIN LATERAL (
+                SELECT sum((payload->>'shares')::numeric) AS sold,sum((payload->>'allocatedCost')::numeric) AS cost FROM investment_cash_ledger
+                WHERE owner_id=e.owner_id AND payload->>'holdingId'=e.id::text AND payload->>'kind'='sale' AND payload->>'date'<=?
+            ) s ON true WHERE holding->>'status'='active' AND holding->>'currency'='RWF'
                 AND holding->>'exchange'='RSE' AND holding->>'tradeDate'<=? GROUP BY owner_id,holding->>'ticker'
         ) INSERT INTO notifications(owner_id,ticker,market_date,previous_date,previous_price,closing_price,shares,cash_cost,event_key)
             SELECT s.owner_id,q.ticker,q.observed_date,q.previous_date,q.previous_price,q.closing_price,s.shares,s.cash_cost,'price:'||q.ticker||':'||q.observed_date
             FROM latest q JOIN positions s USING(ticker) WHERE s.shares>0 AND COALESCE((SELECT (categories->>'prices')::boolean FROM notification_preferences WHERE owner_id=s.owner_id),true)
                 AND NOT EXISTS(SELECT 1 FROM bond_users u WHERE u.id=s.owner_id AND u.disabled_at IS NOT NULL)
-            ON CONFLICT(owner_id,ticker,market_date) DO NOTHING""",date.toString(),date.toString())
+            ON CONFLICT(owner_id,ticker,market_date) DO NOTHING""",date.toString(),date.toString(),date.toString())
         queue()
         return count
     }
@@ -61,6 +64,7 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
         db.update("""INSERT INTO price_push_deliveries(notification_id,device_id)
             SELECT n.id,d.id FROM notifications n JOIN push_devices d ON d.owner_id=n.owner_id
             WHERE n.created_at>=now()-interval '1 day' AND n.read_at IS NULL
+                AND (n.kind<>'subscriptions' OR EXISTS(SELECT 1 FROM bond_month_reminders r WHERE r.owner_id=n.owner_id AND r.month=n.payload->>'month'))
                 AND COALESCE((SELECT (categories->>n.kind)::boolean FROM notification_preferences WHERE owner_id=n.owner_id),true)
             ON CONFLICT DO NOTHING""")
     }
@@ -73,14 +77,18 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
         lockAccount(db,owner)
         val platform=p.text("platform");val token=p.text("token");val device=p.text("deviceId")
         checkApi(uuid(device) && platform in listOf("android","ios") && token.length in 16..4096 && token.all { it.isLetterOrDigit() || it in "_:-" },"Invalid push device.")
+        val liveToken=p.text("liveStartToken")
+        checkApi(liveToken.isEmpty() || platform=="ios" && liveToken.matches(Regex("[a-f0-9]{32,512}")),"Invalid live activity token.")
         val environment=p.text("environment","production");val language=p.text("language","en")
         checkApi(environment in listOf("production","sandbox") && language in listOf("en","fr"),"Invalid push settings.")
         checkApi((db.queryForObject("SELECT count(*) FROM push_devices WHERE owner_id=? AND id<>?::uuid",Int::class.java,owner,device) ?: 0)<20,"Too many registered devices.",409)
+        db.update("DELETE FROM bond_live_activities WHERE device_id=?::uuid AND EXISTS(SELECT 1 FROM push_devices WHERE id=?::uuid AND owner_id<>?)",device,device,owner)
         // A token belongs to exactly one signed-in account, including shared phones.
         db.update("DELETE FROM push_devices WHERE token=? AND id<>?::uuid",token,device)
         db.update("""INSERT INTO push_devices(id,owner_id,platform,token,environment,language) VALUES(?::uuid,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET owner_id=EXCLUDED.owner_id,platform=EXCLUDED.platform,token=EXCLUDED.token,
                 environment=EXCLUDED.environment,language=EXCLUDED.language,updated_at=now()""",device,owner,platform,token,environment,language)
+        db.update("UPDATE push_devices SET live_start_token=? WHERE id=?::uuid AND owner_id=?",liveToken.ifBlank { null },device,owner)
     }
     fun unregister(owner: String,device: String) { checkApi(uuid(device),"Invalid push device.");db.update("DELETE FROM push_devices WHERE id=?::uuid AND owner_id=?",device,owner) }
 }

@@ -4,7 +4,7 @@
 - Cloud Run service: `gabo-portfolio-api`, region `europe-west1`.
 - API origin: https://gabo-portfolio-api-639858675564.europe-west1.run.app
 - Health: `/actuator/health`.
-- Public mobile and website origin remains https://bonds.orestegabo.dev. Vercel's `BONDS_API_ORIGIN` proxies `/api/bonds/*` to Spring before legacy routes. Browser/native cookies and the password-sharing domain stay on the existing origin.
+- Initial mobile and website origin: https://bonds.orestegabo.dev. The 14 November investment-domain backend rollout is recorded in [INVEST_DOMAIN.md](INVEST_DOMAIN.md). Vercel's `BONDS_API_ORIGIN` proxies `/api/bonds/*` to Spring before legacy routes. Browser/native cookies and the password-sharing domain stay on the existing origin.
 - Request-based CPU billing; **one service-level minimum instance since 31 October 2026**, maximum one revision instance, 1 CPU, 1 GiB, concurrency 8, timeout 120 seconds. Initially minimum 0; changed with explicit user approval after production logs proved 17–21 second session cold starts. Revision/container settings and traffic were preserved; see PERFORMANCE.md and the companion KMP `docs/UNLOCK_COLD_START.md` for evidence, costs and verification limits.
 - Dedicated runtime identity `portfolio-runtime`; database password, owner password hash and cron secret in Secret Manager.
 - Neon production branch `plain-wind-27520547` / `production`. JDBC uses pooled queries, direct Flyway migrations, certificate and hostname verification. Four migrations applied.
@@ -32,3 +32,7 @@ Build and publish a new linux/amd64 container to the Portfolio Artifact Registry
 Keep `BONDS_API_ORIGIN` in Vercel Production. The website's legacy database settings remain for rollback, but normal `/api/bonds/*` traffic is handled by Spring. Do not write independently to the old database after cutover. The original website deployment and database are retained as rollback references; a rollback after new writes requires reconciling those writes.
 
 Minimum instances zero and small limits reduce ongoing costs, but do not guarantee a zero bill. No Kaze service or billing configuration was changed.
+
+## Application form retention activated — 17 November 2026
+
+Production now serves `gabo-portfolio-api-retention-ed6b71e` at 100% traffic, built from `ed6b71e` on `feature/guest-mode`. Flyway V19 applied successfully. Public health and an authenticated daily run passed; cleanup completed with zero deletions. The existing daily scheduler now runs the 30-day blank-form policy, retaining unresolved applications and preserving purchases, confirmations and public results. Existing configuration, secrets and scaling were retained. See [retention rollout verification](APPLICATION_FORM_RETENTION.md#production-activation--17-november-2026).

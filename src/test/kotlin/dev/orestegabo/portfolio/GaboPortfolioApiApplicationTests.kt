@@ -22,6 +22,11 @@ class GaboPortfolioApiApplicationTests {
     @LocalServerPort var port: Int=0
     @Autowired lateinit var db: JdbcTemplate
     @Autowired lateinit var json: JsonCodec
+    @Autowired lateinit var bidPortfolio: PortfolioService
+    @Autowired lateinit var formBids: BondApplicationBidService
+    @Autowired lateinit var applicationForms: BondApplicationForms
+    @Autowired lateinit var formCleanup: BondApplicationFormCleanup
+    @Autowired lateinit var transactionManager: org.springframework.transaction.PlatformTransactionManager
     @Autowired lateinit var auth: AuthService
     @Autowired lateinit var lifecycle: LifecycleNotifications
     @Autowired lateinit var notifications: PriceNotifications
@@ -37,13 +42,15 @@ class GaboPortfolioApiApplicationTests {
             p.add("gabo.admin-password-hash") { Passwords.hash(password) }
             p.add("gabo.allowed-origins") { "https://web.example.test" }
             p.add("gabo.cookie-secure") { false }
+            for (key in listOf("gabo.friend-email","gabo.friend-password-hash","gabo.push.firebase-project","gabo.push.apple-team","gabo.push.apple-key-id","gabo.push.apple-key","gabo.import-web-directory")) p.add(key) { "" }
             p.add("gabo.cron-secret") { "synthetic-cron-secret" }
             p.add("gabo.snapshot-secret") { "synthetic-snapshot-secret" }
         }
     }
     @BeforeEach fun clean() {
+        marketTestPages.fail = false
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
-        db.execute("TRUNCATE bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
+        db.execute("TRUNCATE bond_live_activities,bond_month_reminders,investment_cash_ledger,bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
     }
     private fun call(path: String,method: String="GET",body: Any?=null,cookie: String?=null,origin: String?="https://web.example.test",type: String="application/json"): HttpResponse<String> {
@@ -292,6 +299,7 @@ class GaboPortfolioApiApplicationTests {
     }
     @Test fun `price changes alert only eligible holders once and unread data is isolated`() {
         val owner=login();val (uid,other)=user()
+        for(account in listOf("owner",uid)) lifecycle.update(account,mapOf("categories" to notificationCategories.associateWith { it=="prices" }))
         assertEquals(201,call("/equities","POST",equity(),owner).statusCode())
         assertEquals(201,call("/equities","POST",equity(),other).statusCode())
         fun close(day: String,price: Int)=history.record(mapOf("source" to mapOf("status" to "available","stale" to false,
@@ -669,6 +677,26 @@ class GaboPortfolioApiApplicationTests {
         assertFalse(json.write(resolved).contains("SECRET"))
     }
 
+    @Test fun `scanned duplicate proof preserves confirmed schedule and existing financial record`() {
+        val (_,cookie)=user()
+        val dates=listOf("2027-04-23","2027-10-23","2031-10-23")
+        val input=bond("active")+mapOf("couponDates" to dates,"firstCouponDate" to dates.first(),"scheduleConfidence" to "confirmed")
+        val original=data(call("/purchases","POST",input,cookie))["purchase"].record()
+        val proof=data(upload(cookie)).text("documentId")
+        repeat(2) {
+            val response=call("/purchases","POST",input+mapOf("scheduleConfidence" to "estimated","confirmationDocumentId" to proof),cookie)
+            assertEquals(201,response.statusCode(),response.body())
+            val saved=data(response)["purchase"].record()
+            assertEquals(original["id"],saved["id"])
+            assertEquals("confirmed",saved["scheduleConfidence"])
+            assertEquals(original["faceValue"],saved["faceValue"])
+            assertEquals(original["couponDates"],saved["couponDates"])
+            assertEquals(proof,saved["confirmationDocumentId"])
+        }
+        assertEquals(1,data(call("/purchases",cookie=cookie)).records("purchases").size)
+        assertEquals(409,call("/purchases","POST",input+mapOf("scheduleConfidence" to "estimated","confirmationDocumentId" to proof,"feesPaid" to 12000),cookie).statusCode())
+    }
+
     @Test fun `legacy investments gain owned evidence without duplicates or financial changes`() {
         val (_,a)=user(); val (_,b)=user()
         val original=data(call("/purchases","POST",bond("active"),a))["purchase"].record()
@@ -834,11 +862,113 @@ class GaboPortfolioApiApplicationTests {
         val activity=data(response);assertEquals(second,activity["highlightDeviceId"])
         assertEquals(setOf(first,second,third),activity.records("devices").map { it.text("deviceId") }.toSet())
         assertEquals(second,activity.records("devices").first().text("deviceId"))
-        assertTrue(activity.records("devices").all { it.keys==setOf("deviceId","platform","firstSeen") })
+        assertTrue(activity.records("devices").all { it.keys==setOf("deviceId","platform","firstSeen","lastSeen") })
         assertEquals(404,call("/notifications/sign-in-activity?notificationId=$id",cookie=b).statusCode())
         assertTrue(data(call("/notifications/sign-in-activity",cookie=b)).records("devices").isEmpty())
         assertEquals(400,call("/notifications/sign-in-activity?notificationId=invalid",cookie=a).statusCode())
         assertEquals(401,call("/notifications/sign-in-activity").statusCode())
+    }
+
+    private fun guestItem(source: String="guest:bond:synthetic-one",kind: String="bond",record: Record=bond("active"),account: String="owner",docs: List<String> = emptyList()): Record =
+        mapOf("accountId" to account,"confirmed" to true,"sourceId" to source,"kind" to kind,"record" to record,"documentIds" to docs)
+
+    @Test fun `guest migration requires authentication explicit confirmation and the current account`() {
+        val body=guestItem()
+        assertEquals(401,call("/guest-migration/items","POST",body).statusCode())
+        val cookie=login()
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("confirmed" to false),cookie).statusCode())
+        assertEquals(403,call("/guest-migration/items","POST",body+mapOf("accountId" to "another-account"),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("sourceId" to "sample:bond"),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("ownerId" to "another-account"))),cookie).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("confirmationDocumentId" to newId()))),cookie).statusCode())
+        assertEquals(403,call("/guest-migration/status?accountId=another-account",cookie=cookie).statusCode())
+        assertTrue(data(call("/guest-migration/status?accountId=owner",cookie=cookie)).records("items").isEmpty())
+        assertTrue(data(call("/purchases",cookie=cookie)).records("purchases").isEmpty())
+    }
+    @Test fun `guest migration retries are atomic and exact existing investments are matched without replacing notes`() {
+        val cookie=login();val body=guestItem(record=bond("active")+mapOf("notes" to "original private note"))
+        val first=call("/guest-migration/items","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        val again=call("/guest-migration/items","POST",body,cookie);assertEquals(200,again.statusCode(),again.body())
+        assertEquals(data(first)["targetId"],data(again)["targetId"]);assertEquals("already-transferred",data(again)["status"])
+        val matched=call("/guest-migration/items","POST",guestItem(source="guest:bond:second-source",record=bond("active")+mapOf("notes" to "do not overwrite")),cookie)
+        assertEquals(200,matched.statusCode(),matched.body());assertEquals("matched",data(matched)["status"])
+        val rows=data(call("/purchases",cookie=cookie)).records("purchases");assertEquals(1,rows.size);assertEquals("original private note",rows.single()["notes"])
+        assertEquals(409,call("/guest-migration/items","POST",body+mapOf("record" to (bond("active")+mapOf("feesPaid" to 999))),cookie).statusCode())
+        assertEquals(409,call("/guest-migration/items","POST",guestItem(source="guest:bond:collision",record=bond("active")+mapOf("isin" to "RWOTHER12345")),cookie).statusCode())
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+        call("/purchases/${data(first).text("targetId")}","DELETE",cookie=cookie)
+        assertEquals(409,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+    }
+    @Test fun `guest migration equity retries and concurrent submissions cannot duplicate lots`() {
+        val cookie=login();val body=guestItem("guest:share:synthetic-equity","equity",equity()+mapOf("notes" to "keep local note"))
+        val executor=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val jobs=(1..2).map { executor.submit<HttpResponse<String>> { call("/guest-migration/items","POST",body,cookie) } }
+            val responses=jobs.map { it.get(20,java.util.concurrent.TimeUnit.SECONDS) }
+            responses.forEach { assertEquals(200,it.statusCode(),it.body()) }
+            assertEquals(data(responses[0])["targetId"],data(responses[1])["targetId"])
+        } finally { executor.shutdownNow() }
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM equity_purchases",Int::class.java))
+        assertEquals("keep local note",data(call("/equities",cookie=cookie)).records("holdings").single()["notes"])
+    }
+    @Test fun `guest migration only uploads private selected originals with account bound chunk retries`() {
+        val cookie=login();val bytes="%PDF-1.7\nprivate synthetic migration\n%%EOF".toByteArray()
+        val digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val metadata=mapOf("category" to "Bond confirmation","label" to "Bond confirmation","instrumentName" to "","issuer" to "","documentDate" to "2026-10-23")
+        val body=mapOf("accountId" to "owner","confirmed" to true,"sourceId" to "guest:document:synthetic-doc","sha256" to digest,"metadata" to metadata,
+            "uploadId" to "b".repeat(32),"index" to 0,"count" to 1,"content" to Base64.getEncoder().encodeToString(bytes))
+        val first=call("/guest-migration/documents","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        val again=call("/guest-migration/documents","POST",body,cookie);assertEquals(data(first)["documentId"],data(again)["documentId"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals("2026-10-23", data(call("/guest-migration/status?accountId=owner",cookie=cookie)).records("items").single()["documentDate"])
+        assertEquals(400,call("/guest-migration/documents","POST",body+mapOf("sourceId" to "guest:document:public-attempt","metadata" to (metadata+mapOf("category" to "Bond issuance","label" to "Bond issuance"))),cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+        val (otherId,other)=user()
+        assertEquals(403,call("/guest-migration/documents","POST",body,other).statusCode())
+        assertEquals(400,call("/guest-migration/items","POST",guestItem(account=otherId,docs=listOf(data(first).text("documentId"))),other).statusCode())
+        val saved=call("/guest-migration/items","POST",guestItem(docs=listOf(data(first).text("documentId"))),cookie)
+        assertEquals(200,saved.statusCode(),saved.body())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_security_coupon_terms",Int::class.java))
+    }
+    @Test fun `guest migration preserves receipt method and never overwrites a conflicting account receipt`() {
+        val cookie=login();val terms=bond("active")+mapOf("purchaseDate" to "2025-01-01","settlementDate" to "2025-01-02","maturityDate" to "2030-01-01","couponDates" to listOf("2025-07-01","2026-01-01","2030-01-01"))
+        val parent=call("/guest-migration/items","POST",guestItem(record=terms),cookie);assertEquals(200,parent.statusCode(),parent.body())
+        val raw=mapOf("parentSourceId" to "guest:bond:synthetic-one","dueDate" to "2026-01-01","amount" to 68400,"received" to true,"method" to "automatic","currency" to "RWF","recordedAt" to "2026-01-01T12:00:00Z")
+        val body=guestItem("guest:receipt:synthetic-receipt","receipt",raw)
+        val first=call("/guest-migration/items","POST",body,cookie);assertEquals(200,first.statusCode(),first.body())
+        assertEquals(200,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals("automatic",data(call("/notifications/coupons",cookie=cookie)).records("receipts").single()["method"])
+        assertEquals(200,call("/notifications/coupons","POST",mapOf("purchaseId" to data(parent)["targetId"],"dueDate" to "2026-01-01","received" to false),cookie).statusCode())
+        assertEquals(409,call("/guest-migration/items","POST",body,cookie).statusCode())
+        assertEquals(false,data(call("/notifications/coupons",cookie=cookie)).records("receipts").single()["received"])
+        val (id,other)=user()
+        assertEquals(409,call("/guest-migration/items","POST",body+mapOf("accountId" to id),other).statusCode())
+    }
+    @Test fun `guest migration acknowledgments are isolated and removed by account deletion`() {
+        val (id,cookie)=user()
+        val response=call("/guest-migration/items","POST",guestItem(account=id),cookie);assertEquals(200,response.statusCode(),response.body())
+        assertEquals(1,data(call("/guest-migration/status?accountId=$id",cookie=cookie)).records("items").size)
+        assertTrue(data(call("/guest-migration/status?accountId=owner",cookie=login())).records("items").isEmpty())
+        assertEquals(200,call("/auth/account","DELETE",mapOf("password" to password),cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM guest_migration_items WHERE owner_id=?",Int::class.java,id))
+    }
+
+    @Test fun `guest migration document chunks resume after an interruption and metadata conflicts fail closed`() {
+        val cookie=login()
+        val bytes=("%PDF-1.7\n"+"synthetic ".repeat(70000)+"\n%%EOF").toByteArray()
+        val hash=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val metadata=mapOf("category" to "Share contract","label" to "Share contract","instrumentName" to "","issuer" to "","documentDate" to "2026-09-24")
+        val base=mapOf("accountId" to "owner","confirmed" to true,"sourceId" to "guest:document:chunked","sha256" to hash,"metadata" to metadata,"uploadId" to "c".repeat(32),"count" to 2)
+        val first=base+mapOf("index" to 0,"content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(0,512*1024)))
+        assertEquals(200,call("/guest-migration/documents","POST",first,cookie).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(200,call("/guest-migration/documents","POST",first,cookie).statusCode())
+        val last=base+mapOf("index" to 1,"content" to Base64.getEncoder().encodeToString(bytes.copyOfRange(512*1024,bytes.size)))
+        val saved=call("/guest-migration/documents","POST",last,cookie);assertEquals(200,saved.statusCode(),saved.body())
+        assertEquals(data(saved)["documentId"],data(call("/guest-migration/documents","POST",last,cookie))["documentId"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_uploaded_documents",Int::class.java))
+        assertEquals(409,call("/guest-migration/documents","POST",last+mapOf("metadata" to (metadata+mapOf("documentDate" to "2026-09-25"))),cookie).statusCode())
     }
 
 
@@ -933,4 +1063,318 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_document_uploads",Int::class.java))
         assertEquals(1,data(call("/application-forms",cookie=invited)).records("forms").size)
     }
+    @Test fun `security device context is bounded private and snapshots the new device alert`() {
+        val (owner,cookie)=user()
+        lifecycle.signIn(owner,newId(),"ios")
+        val device=newId()
+        val context=mapOf("deviceModel" to "Google Pixel 8", "osVersion" to "Android 16", "appVersion" to "1.0 (42)", "ownerId" to "spoofed", "firstSeen" to "2099-01-01")
+        assertEquals(200,call("/notifications/session-device","POST",context+mapOf("deviceId" to device,"platform" to "android"),cookie).statusCode())
+        val alert=data(call("/notifications",cookie=cookie)).records("notifications").single { it.text("kind")=="security" }
+        assertEquals("Google Pixel 8",alert.text("deviceModel"))
+        assertEquals("Android 16",alert.text("osVersion"))
+        assertTrue(java.time.Instant.parse(alert.text("signedInAt"))<=java.time.Instant.now())
+        val before=data(call("/notifications/sign-in-activity",cookie=cookie)).records("devices").single { it.text("deviceId")==device }
+        assertEquals("1.0 (42)",before.text("appVersion"))
+        assertFalse(before.containsKey("ownerId"))
+        assertFalse(before.text("firstSeen").startsWith("2099"))
+        lifecycle.signIn(owner,device,"android",mapOf("deviceModel" to "x".repeat(121),"osVersion" to "bad\nvalue","appVersion" to "1.1 (43)"))
+        val after=data(call("/notifications/sign-in-activity",cookie=cookie)).records("devices").single { it.text("deviceId")==device }
+        assertEquals("Google Pixel 8",after.text("deviceModel"))
+        assertEquals("Android 16",after.text("osVersion"))
+        assertEquals("1.1 (43)",after.text("appVersion"))
+        assertEquals(before.text("firstSeen"),after.text("firstSeen"))
+        assertTrue(java.time.Instant.parse(after.text("lastSeen"))>=java.time.Instant.parse(before.text("lastSeen")))
+        val alerts=data(call("/notifications",cookie=cookie)).records("notifications").filter { it.text("kind")=="security" }
+        assertEquals(1,alerts.size)
+        assertEquals("1.0 (42)",alerts.single().text("appVersion"))
+        val (_,other)=user()
+        assertTrue(data(call("/notifications/sign-in-activity",cookie=other)).records("devices").isEmpty())
+    }
+
+    private fun ledgerEntry(kind: String="deposit",id: String=newId()) = mapOf("id" to id,"kind" to kind,"date" to "2026-01-01","currency" to "RWF","amount" to 40000)
+    @Test fun `cash ledger records are account scoped retry safe and validated`() {
+        val (_,a)=user();val (_,b)=user();val body=ledgerEntry()
+        assertEquals(401,call("/cash-ledger","POST",body).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,a).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,a).statusCode())
+        assertEquals(409,call("/cash-ledger","POST",body+mapOf("amount" to 50000),a).statusCode())
+        assertEquals(1,data(call("/cash-ledger",cookie=a)).records("entries").size)
+        assertTrue(data(call("/cash-ledger",cookie=b)).records("entries").isEmpty())
+        assertEquals(404,call("/cash-ledger/${body["id"]}","DELETE",cookie=b).statusCode())
+        assertEquals(400,call("/cash-ledger","POST",ledgerEntry()+mapOf("date" to "2099-01-01"),a).statusCode())
+        assertEquals(400,call("/cash-ledger","POST",ledgerEntry()+mapOf("amount" to -1),a).statusCode())
+        assertEquals(200,call("/cash-ledger/${body["id"]}","DELETE",cookie=a).statusCode())
+    }
+    @Test fun `partial share sales preserve purchases and derive net proceeds cost and remaining balances`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val body=mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 250,"price" to 110,"fees" to 100,"tax" to 0,"realizedGain" to 999999)
+        val sale=call("/cash-ledger","POST",body,cookie)
+        assertEquals(200,sale.statusCode(),sale.body())
+        val entry=data(sale)["entry"].record()
+        assertEquals(0,entry.decimal("allocatedCost").compareTo(java.math.BigDecimal("22775")))
+        assertEquals(0,entry.decimal("realizedGain").compareTo(java.math.BigDecimal("4625")))
+        val saved=data(call("/equities",cookie=cookie)).records("holdings").single()
+        assertEquals(1000.0,saved.number("shares"));assertEquals(750.0,saved.number("remainingShares"));assertEquals(68325.0,saved.number("remainingCost"))
+        assertEquals(409,call("/cash-ledger","POST",body+mapOf("id" to newId(),"shares" to 751),cookie).statusCode())
+        assertEquals(200,call("/cash-ledger","POST",body,cookie).statusCode())
+        val (_,other)=user()
+        assertEquals(404,call("/cash-ledger","POST",body+mapOf("id" to newId()),other).statusCode())
+        assertEquals(200,call("/cash-ledger/${body["id"]}","DELETE",cookie=cookie).statusCode())
+        assertEquals(1000.0,data(call("/equities",cookie=cookie)).records("holdings").single().number("remainingShares"))
+    }
+    @Test fun `concurrent sales cannot oversell a purchase`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        val pool=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val tasks=(1..2).map { pool.submit<Int> { call("/cash-ledger","POST",mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 600,"price" to 100),cookie).statusCode() } }
+            assertEquals(listOf(200,409),tasks.map { it.get(30,java.util.concurrent.TimeUnit.SECONDS) }.sorted())
+            assertEquals(400.0,data(call("/equities",cookie=cookie)).records("holdings").single().number("remainingShares"))
+        } finally { pool.shutdownNow() }
+    }
+
+    @Test fun `guest sale transfers after its purchase and retries retain one transaction`() {
+        val cookie=login();val source="guest:share:ledger-parent"
+        val purchase=call("/guest-migration/items","POST",guestItem(source,"equity",equity()),cookie)
+        assertEquals(200,purchase.statusCode(),purchase.body())
+        val target=data(purchase).text("targetId")
+        val sale=mapOf("kind" to "sale","parentSourceId" to source,"date" to "2026-10-01","currency" to "RWF","shares" to 250,"price" to 110,"fees" to 100)
+        val body=guestItem("guest:cash:ledger-sale","cash",sale)
+        val first=call("/guest-migration/items","POST",body,cookie)
+        assertEquals(200,first.statusCode(),first.body())
+        val retry=call("/guest-migration/items","POST",body,cookie)
+        assertEquals(200,retry.statusCode(),retry.body());assertEquals(data(first).text("targetId"),data(retry).text("targetId"))
+        assertEquals(1,data(call("/cash-ledger",cookie=cookie)).records("entries").size)
+        assertEquals(750.0,data(call("/equities",cookie=cookie)).records("holdings").single { it.text("id")==target }.number("remainingShares"))
+        assertEquals(409,call("/guest-migration/items","POST",guestItem("guest:cash:missing","cash",sale+mapOf("parentSourceId" to "guest:share:missing")),cookie).statusCode())
+    }
+    @Test fun `fully sold shares do not generate later price impact alerts`() {
+        val cookie=login();val holding=data(call("/equities","POST",equity(),cookie))["holding"].record()
+        assertEquals(200,call("/cash-ledger","POST",mapOf("id" to newId(),"kind" to "sale","holdingId" to holding["id"],"date" to "2026-10-01","currency" to "RWF","shares" to 1000,"price" to 100),cookie).statusCode())
+        for((day,price) in listOf("2026-10-01" to 100,"2026-10-02" to 110)) history.record(mapOf("source" to mapOf("status" to "available","stale" to false,"publishedAt" to "${day}T12:00:00Z","checkedAt" to "${day}T13:00:00Z"),"quotes" to listOf(mapOf("ticker" to "IMR","closing" to price))))
+        assertEquals(0,notifications.collect("2026-10-02"))
+    }
+
+    private fun verifiedBidForm(): String {
+        val bytes=syntheticApplicationPdf()
+        val hash=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        return applicationForms.store(applicationForms.metadata("2026-11-5y-new"),hash,bytes).text("documentId")
+    }
+    @Test fun `form bids use extracted canonical fields and remain pending outside active totals`() {
+        val id=verifiedBidForm();val (owner,_)=user();val bidId=newId()
+        val saved=formBids.create(owner,id,mapOf("amount" to 1000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-01"))
+        assertEquals("FXD 6/2026/5YRS",saved.text("bondName"));assertEquals("2026-11-13",saved.text("settlementDate"));assertEquals("2031-11-07",saved.text("maturityDate"))
+        assertEquals("submitted",saved.text("status"));assertEquals(0.0,saved.number("couponRate"));assertEquals(0.0,saved.number("feesPaid"))
+        assertEquals(id,saved.text("applicationFormDocumentId"));assertEquals(1000000.0,saved.number("bidAmount"))
+        val overview=MobileOverview.create(listOf(saved),emptyList(),java.time.LocalDate.parse("2026-11-01"))
+        assertTrue(overview.records("purchases").any { it["id"]==saved["id"] })
+        val retry=formBids.create(owner,id,mapOf("amount" to 1000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-20"))
+        assertEquals(saved["id"],retry["id"])
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE owner_id=?",Int::class.java,owner))
+        assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to 2000000,"bidId" to bidId),java.time.LocalDate.parse("2026-11-02")) }
+    }
+    @Test fun `form bids are allowed before opening and on closing day but never after closing or before issuance month`() {
+        val id=verifiedBidForm();val (owner,_)=user()
+        for(day in listOf("2026-11-01","2026-11-08","2026-11-09","2026-11-11")) {
+            val amount=(day.takeLast(2).toInt()+1)*100000
+            assertEquals("submitted",formBids.create(owner,id,mapOf("amount" to amount,"bidId" to newId()),java.time.LocalDate.parse(day)).text("status"))
+        }
+        for(day in listOf("2026-10-31","2026-11-12","2027-11-01")) assertThrows(ApiError::class.java) {
+            formBids.create(owner,id,mapOf("amount" to 100000,"bidId" to newId()),java.time.LocalDate.parse(day))
+        }
+        assertEquals(4,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE owner_id=?",Int::class.java,owner))
+    }
+    @Test fun `form bids reject spoofed fields bad increments and unverified PDF metadata`() {
+        val id=verifiedBidForm();val (owner,_)=user();val day=java.time.LocalDate.parse("2026-11-01")
+        for(amount in listOf(-1,0,99999,150000)) assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to amount,"bidId" to newId()),day) }
+        assertThrows(ApiError::class.java) { formBids.create(owner,id,mapOf("amount" to 100000,"bidId" to newId(),"status" to "active","settlementDate" to "2099-01-01"),day) }
+        assertThrows(ApiError::class.java) { formBids.create(owner,newId(),mapOf("amount" to 100000,"bidId" to newId()),day) }
+        assertEquals(401,call("/application-forms/$id/bids","POST",mapOf("amount" to 100000,"bidId" to newId())).statusCode())
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+    }
+    @Test fun `legacy stored forms extract terms once without duplicating the shared document`() {
+        val bytes=syntheticApplicationPdf();val id=newId()
+        db.update("INSERT INTO bond_application_forms(id,issue_key,sha256,content,metadata) VALUES(?::uuid,?,?,?,?::jsonb)",id,"legacy-key","synthetic-hash",Base64.getEncoder().encodeToString(bytes),json.write(applicationForms.metadata("2026-11-5y-new")))
+        val first=applicationForms.documents().single();assertEquals("FXD 6/2026/5YRS",first["bidTerms"].record().text("bondName"))
+        assertEquals(first,applicationForms.documents().single());assertFalse(first.containsKey("_bidParseVersion"))
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM bond_application_forms",Int::class.java))
+    }
+
+    @Test fun `BNR results enrich a form bid and explicit confirmation retains its form and original amount`() {
+        val form=verifiedBidForm();val (owner,_)=user();val retry=newId()
+        val saved=formBids.create(owner,form,mapOf("amount" to 1000000,"bidId" to retry),java.time.LocalDate.parse("2026-11-01"))
+        val resultId=newId()
+        val terms=mapOf("issuanceDate" to "2026-11-11","bondName" to "FXD 6/2026/5YRS","isin" to "RW-SYNTHETIC-5Y","tenorYears" to 5,"settlementDate" to "2026-11-13","maturityDate" to "2031-11-07",
+            "couponRate" to .12,"pricePercent" to 100,"firstCouponDate" to "2027-05-07","couponDates" to listOf("2027-05-07","2031-11-07"),"couponFrequency" to 2,"scheduleConfidence" to "confirmed")
+        db.update("INSERT INTO bond_issuance_documents(id,issue_key,sha256,content,metadata) VALUES(?::uuid,?,?,?,?::jsonb)",resultId,"synthetic-5y-result","synthetic-result-hash",Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public result\n%%EOF".toByteArray()),json.write(mapOf("issuance" to terms)))
+        val enriched=bidPortfolio.bond(owner,saved.text("id"))!!
+        assertEquals("submitted",enriched.text("status"));assertEquals(.12,enriched.number("couponRate"));assertEquals(1000000.0,enriched.number("faceValue"))
+        assertEquals(form,enriched.text("applicationFormDocumentId"));assertEquals(resultId,enriched.text("issuanceDocumentId"))
+        val confirmed=bidPortfolio.confirmPending(owner,saved.text("id"),mapOf("confirmed" to true,"issuanceDocumentId" to resultId))
+        assertEquals("active",confirmed.text("status"));assertEquals("2026-11-11",confirmed.text("purchaseDate"));assertEquals(saved["id"],confirmed["id"]);assertEquals(form,confirmed.text("applicationFormDocumentId"))
+        db.update("UPDATE bond_purchases SET face_value=900000,amount_invested=900000 WHERE id=?::uuid",saved["id"])
+        val retried=formBids.create(owner,form,mapOf("amount" to 1000000,"bidId" to retry),java.time.LocalDate.parse("2026-11-20"))
+        assertEquals(saved["id"],retried["id"]);assertEquals(900000.0,retried.number("faceValue"));assertEquals(1000000.0,retried.number("bidAmount"))
+    }
+
+
+    private val retentionNow = Instant.parse("2026-12-11T12:00:00Z")
+    private fun retentionResults(form: String, published: Instant, changes: Record = emptyMap()): String {
+        val metadata = json.read(db.queryForObject("SELECT metadata::text FROM bond_application_forms WHERE id=?::uuid",String::class.java,form)!!)
+        val terms = metadata["applicationForm"].record().filterKeys { it in setOf("settlementDate","maturityDate","tenorYears","issuanceDate") } +
+            mapOf("bondName" to "FXD 6/2026/5YRS","isin" to "RW-SYNTHETIC-RETENTION","couponRate" to .12,"pricePercent" to 100,
+                "firstCouponDate" to "2027-05-07","couponDates" to listOf("2027-05-07","2031-11-07"),"couponFrequency" to 2,"scheduleConfidence" to "estimated") + changes
+        val id = newId()
+        db.update("INSERT INTO bond_issuance_documents(id,issue_key,sha256,content,metadata,created_at) VALUES(?::uuid,?,?,?,?::jsonb,?::timestamptz)",
+            id,id,id,Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public results\n%%EOF".toByteArray()),
+            json.write(mapOf("category" to "Bond issuance","visibility" to "shared","issuance" to terms)),published.toString())
+        return id
+    }
+    private fun retentionPending(owner: String="owner",settlement: String="2026-11-13"): Record = bidPortfolio.saveBond(owner,
+        bond()+mapOf("settlementDate" to settlement,"maturityDate" to "2031-11-07","tenorYears" to 5))
+
+    @Test fun `retention migration backfills existing bid identities without cascading purchases`() {
+        val schema="retention_upgrade_"+newId().replace("-","")
+        db.dataSource!!.connection.use { connection ->
+            val previous=connection.schema
+            val isolated=JdbcTemplate(org.springframework.jdbc.datasource.SingleConnectionDataSource(connection,true))
+            try {
+                isolated.execute("CREATE SCHEMA $schema")
+                connection.schema=schema
+                isolated.execute("CREATE TABLE bond_application_forms(id uuid PRIMARY KEY)")
+                isolated.execute("CREATE TABLE bond_purchases(id uuid PRIMARY KEY,application_form_id uuid REFERENCES bond_application_forms(id),amount numeric)")
+                val form=newId();val purchase=newId()
+                isolated.update("INSERT INTO bond_application_forms VALUES(?::uuid)",form)
+                isolated.update("INSERT INTO bond_purchases VALUES(?::uuid,?::uuid,123456.78)",purchase,form)
+                org.springframework.jdbc.datasource.init.ResourceDatabasePopulator(
+                    org.springframework.core.io.ClassPathResource("db/migration/V19__application_form_retention.sql")
+                ).execute(isolated.dataSource!!)
+                isolated.update("DELETE FROM bond_application_forms WHERE id=?::uuid",form)
+                val saved=isolated.queryForList("SELECT * FROM bond_purchases").single()
+                assertEquals(purchase,saved["id"].toString())
+                assertEquals(form,saved["application_form_origin_id"].toString())
+                org.junit.jupiter.api.Assertions.assertNull(saved["application_form_id"])
+                assertEquals(java.math.BigDecimal("123456.78"),saved["amount"])
+            } finally {
+                connection.schema=previous
+                isolated.execute("DROP SCHEMA IF EXISTS $schema CASCADE")
+            }
+        }
+    }
+
+    @Test fun `blank form cleanup waits for matching published results and thirty full days`() {
+        val form=verifiedBidForm()
+        db.update("UPDATE bond_application_forms SET created_at='2000-01-01' WHERE id=?::uuid",form)
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("settlementDate" to "2026-10-23"))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("maturityDate" to "2030-11-07"))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("tenorYears" to 10))
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        val publication=retentionNow.minusSeconds(30*86400-1)
+        retentionResults(form,publication,mapOf("tenorYears" to 5.0))
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        assertEquals(1,formCleanup.deleteExpired(retentionNow.plusSeconds(1)))
+        org.junit.jupiter.api.Assertions.assertNull(applicationForms.download(form))
+        assertTrue(applicationForms.documents().isEmpty())
+        assertEquals(0,formCleanup.deleteExpired(retentionNow.plusSeconds(86400)))
+        assertEquals(4,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+    }
+
+    @Test fun `blank form cleanup never removes a form while its subscription day is still open`() {
+        val form=verifiedBidForm()
+        retentionResults(form,Instant.parse("2026-10-01T00:00:00Z"))
+        assertEquals(0,formCleanup.deleteExpired(Instant.parse("2026-11-11T21:59:59Z")))
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        assertEquals(1,formCleanup.deleteExpired(Instant.parse("2026-11-11T22:00:00Z")))
+    }
+
+    @Test fun `blank form cleanup retains linked and unlinked unresolved applications across accounts`() {
+        val form=verifiedBidForm();retentionResults(form,retentionNow.minusSeconds(31*86400))
+        val (first,_)=user();val (second,_)=user()
+        val linked=formBids.create(first,form,mapOf("amount" to 1000000,"bidId" to newId()),java.time.LocalDate.parse("2026-11-01"))
+        val unlinked=retentionPending(second)
+        val unrelated=retentionPending(second,"2026-12-13")
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        db.update("UPDATE bond_purchases SET status='active' WHERE id=?::uuid",linked["id"])
+        assertEquals(0,formCleanup.deleteExpired(retentionNow.plusSeconds(86400)))
+        db.update("UPDATE bond_purchases SET status='active' WHERE id=?::uuid",unlinked["id"])
+        assertEquals(1,formCleanup.deleteExpired(retentionNow.plusSeconds(2*86400)))
+        assertEquals(3,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+        assertEquals("submitted",db.queryForObject("SELECT status FROM bond_purchases WHERE id=?::uuid",String::class.java,unrelated["id"]))
+    }
+
+    @Test fun `blank form cleanup preserves all resolved purchase data confirmations and bid retries`() {
+        val form=verifiedBidForm();val report=retentionResults(form,retentionNow.minusSeconds(30*86400))
+        val cookie=login();val confirmation=data(upload(cookie)).text("documentId")
+        notifications.event("owner","subscriptions","synthetic-retired-form",java.time.LocalDate.parse("2026-11-11"),
+            mapOf("calendarId" to "2026-11-5y-new","documentId" to form,"action" to "calendar"))
+        val bids=listOf("active","sold","matured").mapIndexed { index,status ->
+            val amount=(index+1)*1000000
+            val bid=newId()
+            val purchase=formBids.create("owner",form,mapOf("amount" to amount,"bidId" to bid),java.time.LocalDate.parse("2026-11-01"))
+            db.update("UPDATE bond_purchases SET status=?,confirmation_document_id=?::uuid,confirmation_method='document' WHERE id=?::uuid",status,confirmation,purchase["id"])
+            Triple(purchase.text("id"),bid,amount)
+        }
+        fun snapshots()=db.queryForList("SELECT (to_jsonb(p)-'application_form_id')::text AS data FROM bond_purchases p ORDER BY id")
+        val purchasesBefore=snapshots()
+        val filesBefore=db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_uploaded_documents d ORDER BY id")
+        val resultsBefore=db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_issuance_documents d ORDER BY id")
+        assertEquals(1,formCleanup.deleteExpired(retentionNow))
+        val alert=json.read(db.queryForObject("SELECT payload::text FROM notifications WHERE event_key='synthetic-retired-form'",String::class.java)!!)
+        assertFalse(alert.containsKey("documentId"));assertEquals("2026-11-5y-new",alert["calendarId"])
+        assertEquals(purchasesBefore,snapshots());assertEquals(filesBefore,db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_uploaded_documents d ORDER BY id"))
+        assertEquals(resultsBefore,db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_issuance_documents d ORDER BY id"))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE application_form_id IS NOT NULL",Int::class.java))
+        assertEquals(404,call("/documents/$form",cookie=cookie).statusCode())
+        assertEquals(200,call("/documents/$confirmation",cookie=cookie).statusCode())
+        assertEquals(200,call("/documents/$report",cookie=cookie).statusCode())
+        for((id,bid,amount) in bids) {
+            val retried=formBids.create("owner",form,mapOf("amount" to amount,"bidId" to bid),java.time.LocalDate.parse("2026-12-11"))
+            assertEquals(id,retried.text("id"));assertTrue(retried.text("applicationFormDocumentId").isBlank())
+            assertEquals(form,db.queryForObject("SELECT application_form_origin_id::text FROM bond_purchases WHERE id=?::uuid",String::class.java,id))
+            assertThrows(ApiError::class.java) { formBids.create("owner",newId(),mapOf("amount" to amount,"bidId" to bid)) }
+            assertThrows(ApiError::class.java) { formBids.create("owner",form,mapOf("amount" to amount+100000,"bidId" to bid)) }
+        }
+    }
+
+    @Test fun `blank form cleanup waits for concurrent pending writes before checking eligibility`() {
+        val form=verifiedBidForm();retentionResults(form,retentionNow.minusSeconds(31*86400))
+        val inserted=java.util.concurrent.CountDownLatch(1)
+        val release=java.util.concurrent.CountDownLatch(1)
+        val started=java.util.concurrent.CountDownLatch(1)
+        val executor=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val writer=executor.submit {
+                org.springframework.transaction.support.TransactionTemplate(transactionManager).execute {
+                    retentionPending()
+                    inserted.countDown()
+                    check(release.await(5,java.util.concurrent.TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(inserted.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            val cleanup=executor.submit<Int> { started.countDown();formCleanup.deleteExpired(retentionNow) }
+            assertTrue(started.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { cleanup.get(200,java.util.concurrent.TimeUnit.MILLISECONDS) }
+            release.countDown();writer.get(5,java.util.concurrent.TimeUnit.SECONDS)
+            assertEquals(0,cleanup.get(5,java.util.concurrent.TimeUnit.SECONDS))
+            org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        } finally { release.countDown();executor.shutdownNow() }
+    }
+
+    @Test fun `authenticated daily job cleans blank forms even when market collection fails`() {
+        val form=verifiedBidForm();retentionResults(form,Instant.now().minusSeconds(31*86400))
+        assertEquals(401,call("/rse/daily").statusCode())
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        marketTestPages.fail=true
+        try {
+            val request=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds/rse/daily"))
+                .header("Authorization","Bearer synthetic-cron-secret").GET().build()
+            val response=http.send(request,HttpResponse.BodyHandlers.ofString())
+            assertEquals(503,response.statusCode())
+            val cleanup=data(response)["applicationFormCleanup"].record()
+            assertEquals("completed",cleanup["status"]);assertEquals(1.0,cleanup.number("deleted"))
+            org.junit.jupiter.api.Assertions.assertNull(applicationForms.download(form))
+        } finally { marketTestPages.fail=false }
+    }
+
 }

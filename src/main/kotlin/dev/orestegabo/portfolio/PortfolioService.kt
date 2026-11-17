@@ -17,7 +17,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         pending.refresh(owner)
         val publicEvidence = db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it.text("id") to json.read(it["metadata"].toString())["issuance"].record() }
         return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata,COALESCE(c.legacy_id,c.id::text,p.confirmation_document_id::text) AS confirmation_reference FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id LEFT JOIN bond_uploaded_documents c ON c.id=p.confirmation_document_id AND c.owner_id=p.owner_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
-            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"statementDocumentId" to row["statement_document_id"]?.toString())
+            val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"applicationFormDocumentId" to row["application_form_id"]?.toString(),"bidId" to row["client_bid_id"]?.toString(),"bidAmount" to row["bid_amount"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
                 "couponDates" -> json.mapper.readValue(row[column(key)].toString(),List::class.java)
                 in dates -> row[column(key)]?.toString() ?: ""
@@ -33,8 +33,16 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         }
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
-    fun shares(owner: String): List<Record> = db.query("SELECT holding FROM equity_purchases WHERE owner_id=? ORDER BY holding->>'tradeDate' DESC,created_at DESC", { r,_ -> json.read(r.getString(1)) },owner)
-    @Transactional fun saveBond(owner: String, raw: Record, id: String? = null): Record {
+    fun shares(owner: String): List<Record> = db.query("""SELECT holding || jsonb_build_object(
+        'remainingShares',(holding->>'shares')::numeric-COALESCE(s.sold,0),
+        'soldShares',COALESCE(s.sold,0),
+        'remainingCost',(holding->>'netAmountPayable')::numeric-COALESCE(s.cost,0))
+        FROM equity_purchases e LEFT JOIN LATERAL (
+            SELECT sum((payload->>'shares')::numeric) AS sold,sum((payload->>'allocatedCost')::numeric) AS cost
+            FROM investment_cash_ledger WHERE owner_id=e.owner_id AND payload->>'holdingId'=e.id::text AND payload->>'kind'='sale'
+        ) s ON true WHERE owner_id=? ORDER BY holding->>'tradeDate' DESC,created_at DESC""", { r,_ -> json.read(r.getString(1)) },owner)
+
+    @Transactional fun saveBond(owner: String, raw: Record, id: String? = null, contributeCouponTerms: Boolean = true): Record {
         lockAccount(db,owner)
         val purchase = validation.bond(raw)
         val incomingProof=raw.text("confirmationDocumentId")
@@ -48,7 +56,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 val priorProof=existing.text("confirmationDocumentId")
                 checkApi(priorProof.isBlank() || documents.ownedEvidenceId(owner,priorProof,"Bond confirmation")==canonicalProof,"This purchase already has another confirmation PDF.",409)
                 db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid,updated_at=now() WHERE owner_id=? AND id=?::uuid",canonicalProof,owner,prior["id"])
-                instruments.contributePrivateCouponTerms(purchase)
+                if(contributeCouponTerms) instruments.contributePrivateCouponTerms(purchase)
                 return bond(owner,prior.text("id"))!!
             }
         }
@@ -62,7 +70,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         val proof=raw.text("confirmationDocumentId")
         if(proof.isNotBlank()) {
             db.update("UPDATE bond_purchases SET confirmation_method='document',confirmation_document_id=?::uuid WHERE id=?::uuid",canonicalProof,p["id"])
-            instruments.contributePrivateCouponTerms(p)
+            if(contributeCouponTerms) instruments.contributePrivateCouponTerms(p)
         }
         pending.refresh(owner)
         return bond(owner,p.text("id"))!!
@@ -81,11 +89,11 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         lockAccount(db,owner); checkApi(uuid(id),"Invalid purchase id.")
         return db.update("DELETE FROM bond_purchases WHERE owner_id=? AND id=?::uuid",owner,id)>0
     }
-    @Transactional fun saveShare(owner: String,raw: Record): Record {
+    @Transactional fun saveShare(owner: String,raw: Record,preserveNotes: Boolean = false): Record {
         lockAccount(db,owner)
         val documentId=raw.text("contractDocumentId").takeIf(String::isNotBlank)
         if(documentId!=null)checkApi(uuid(documentId) && db.queryForList("SELECT id FROM bond_uploaded_documents WHERE owner_id=? AND id=?::uuid AND metadata->>'category'='Share contract'",owner,documentId).isNotEmpty(),"Share contract PDF not found.")
-        val p = validation.equity(raw)+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
+        val p = validation.equity(raw)+(if(preserveNotes)mapOf("notes" to raw.text("notes").trim().also { checkApi(it.length<=1000,"Notes are too long.") }) else emptyMap())+mapOf("id" to newId(),"createdAt" to Instant.now().toString())+(documentId?.let { mapOf("contractDocumentId" to it) } ?: emptyMap())
         if(documentId!=null) {
             val candidates=shares(owner).filter { validation.equityKey(it)==validation.equityKey(p) }
             checkApi(candidates.size<=1,"Multiple matching purchases require review.",409)
@@ -101,11 +109,6 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         db.update("INSERT INTO equity_purchases(id,owner_id,dedup_key,contract_key,report_key,holding) VALUES (?::uuid,?,?,?,?,?::jsonb)",p["id"],owner,validation.equityKey(p),contract,p.text("tradeReportId").ifBlank { null },json.write(p))
         return p
     }
-    // Preserve optional notes/source fields; every normalized financial/identity field must agree.
-    private fun sameFinancialRecord(a: Record,b: Record): Boolean = (a.keys+b.keys).filterNot { it in setOf("notes","sourceUrl","accountReference") }.all { key ->
-        val x=a[key]; val y=b[key]
-        if(x is Number && y is Number) x.toString().toBigDecimal().compareTo(y.toString().toBigDecimal())==0 else x==y
-    }
     fun accounts(owner: Account,friend: Account?): List<Record> {
         val accounts = mutableListOf<Record>(mapOf("id" to owner.id,"email" to owner.email,"createdAt" to null,"status" to "active","kind" to "owner","deletable" to false))
         friend?.let { accounts+=mapOf("id" to it.id,"email" to it.email,"createdAt" to null,"status" to "active","kind" to "environment","deletable" to false) }
@@ -118,13 +121,13 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
 }
 
 object MobileOverview {
-    fun create(bonds: List<Record>,shares: List<Record>,today: LocalDate = LocalDate.now(ZoneOffset.UTC)): Record {
+    fun create(bonds: List<Record>,shares: List<Record>,today: LocalDate = notificationToday()): Record {
         val from=today.minusYears(1).toString(); val through=today.toString()
         fun recent(rows: List<Record>,key: String)=rows.filter { it.text(key) in from..through }.sortedWith(compareByDescending<Record> { it.text(key) }.thenByDescending { it.text("createdAt") }.thenBy { it.text("id") }).take(12)
         val rb=recent(bonds,"purchaseDate"); val rs=recent(shares,"tradeDate")
         val bIds=rb.map { it["id"] }.toSet(); val sIds=rs.map { it["id"] }.toSet()
         val basis=bonds.filter { it.text("status")=="active" && it["id"] !in bIds }.map { it.filterKeys { k->k !in listOf("notes","sourceUrl","accountReference","createdAt") } }
-        val positions=shares.filter { it.text("status")=="active" && it.text("tradeDate")<=through && it["id"] !in sIds }.groupBy { listOf(it.text("currency"),it.text("ticker")) }.map { (key,rows)-> mapOf("id" to "aggregate:[\"${key[0]}\",\"${key[1]}\"]","currency" to key[0],"ticker" to key[1],"status" to "active","tradeDate" to rows.minOf { it.text("tradeDate") },"shares" to rows.sumOf { it.decimal("shares") },"netAmountPayable" to rows.sumOf { it.decimal("netAmountPayable") },"lotCount" to rows.size) }
+        val positions=shares.filter { it.text("status")=="active" && it.text("tradeDate")<=through && it["id"] !in sIds }.groupBy { listOf(it.text("currency"),it.text("ticker")) }.map { (key,rows)-> mapOf("id" to "aggregate:[\"${key[0]}\",\"${key[1]}\"]","currency" to key[0],"ticker" to key[1],"status" to "active","tradeDate" to rows.minOf { it.text("tradeDate") },"shares" to rows.sumOf { if(it.containsKey("remainingShares"))it.decimal("remainingShares") else it.decimal("shares") },"netAmountPayable" to rows.sumOf { if(it.containsKey("remainingCost"))it.decimal("remainingCost") else it.decimal("netAmountPayable") },"lotCount" to rows.size) }
         return mapOf("version" to 1,"from" to from,"through" to through,"previewLimit" to 12,"monthlyInvestmentTotals" to totals(bonds,shares,today),"recentPurchaseIds" to bIds.toList(),"recentHoldingIds" to sIds.toList(),"purchases" to rb+basis,"holdings" to rs+positions)
     }
     fun totals(bonds: List<Record>,shares: List<Record>,today: LocalDate): List<Record> {

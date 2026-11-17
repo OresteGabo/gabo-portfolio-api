@@ -18,7 +18,7 @@ class AuthController(private val auth: AuthService, private val portfolios: Port
         checkApi(email != null && body["password"] is String && body.text("password").length <= 128, "Invalid email or password.", 401)
         val account = auth.authenticate(email!!, body.text("password")) ?: throw ApiError(401, "Invalid email or password.")
         RequestPerformance.measure("session_create") { auth.start(account, request, response) }
-        runCatching { RequestPerformance.measure("security_notification_queue") { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform")) } }
+        runCatching { RequestPerformance.measure("security_notification_queue") { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform"),body) } }
         return mapOf("authenticated" to true, "user" to account.publicInfo())
     }
     @PostMapping("/logout") fun logout(request: HttpServletRequest, response: HttpServletResponse, @RequestBody(required=false) body: Record?): Record {
@@ -35,7 +35,7 @@ class AuthController(private val auth: AuthService, private val portfolios: Port
         checkApi(Regex("[A-Za-z0-9_-]{43}").matches(body.text("invite")), "This invitation is invalid or expired.", 403)
         val account = auth.register(email!!, body.text("password"), body.text("invite"))
         RequestPerformance.measure("session_create") { auth.start(account, request, response) }
-        runCatching { RequestPerformance.measure("security_notification_queue") { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform")) } }
+        runCatching { RequestPerformance.measure("security_notification_queue") { lifecycle.signIn(account.id,body.text("deviceId"),body.text("platform"),body) } }
         return mapOf("authenticated" to true, "user" to account.publicInfo())
     }
     @GetMapping("/registration") fun registration(): Record {

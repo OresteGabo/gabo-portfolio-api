@@ -45,8 +45,8 @@ class PendingIssuanceService(private val db: JdbcTemplate,private val json: Json
         val ready=terms.isNotEmpty() && p.text("status")=="submitted"
         val cash=if(ready) p.decimal("faceValue")*terms.decimal("pricePercent")/BigDecimal(100)+p.decimal("accruedInterestPaid")+p.decimal("feesPaid") else BigDecimal.ZERO
         val preview=if(ready)p+terms.filterKeys { it in listOf("bondName","isin","couponRate","couponDates","couponFrequency","firstCouponDate","scheduleConfidence","maturityDate","pricePercent") }+
-            mapOf("notes" to if(p.text("notes")=="Pending application. Allocation, executed price and coupon are unconfirmed; stored price is provisional.") "" else p.text("notes"),
-                "purchaseDate" to minOf(p.text("purchaseDate"),p.text("settlementDate")),"amountInvested" to cash.setScale(2,RoundingMode.HALF_UP),"status" to "active") else null
+            mapOf("notes" to if(p.text("notes") in setOf("Pending application. Allocation, executed price and coupon are unconfirmed; stored price is provisional.","Pending bid. Allocation, executed price, fees and coupon are unconfirmed.")) "" else p.text("notes"),
+                "purchaseDate" to if(p.text("applicationFormDocumentId").isNotBlank()) terms.text("issuanceDate").takeIf { date(it)!=null } ?: p.text("settlementDate") else minOf(p.text("purchaseDate"),p.text("settlementDate")),"amountInvested" to cash.setScale(2,RoundingMode.HALF_UP),"status" to "active") else null
         return p+mapOf("issuanceDocumentId" to document?.toString(),"confirmationMethod" to method,"confirmationDocumentId" to personal?.toString(),
             "publishedTermsAvailable" to ready,"canConfirmWithoutPdf" to (ready && (cash-p.decimal("amountInvested")).abs()<=BigDecimal("0.02")),"manualConfirmation" to preview)
     }
