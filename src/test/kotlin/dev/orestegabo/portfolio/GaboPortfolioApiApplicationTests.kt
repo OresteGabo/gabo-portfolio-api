@@ -25,6 +25,8 @@ class GaboPortfolioApiApplicationTests {
     @Autowired lateinit var bidPortfolio: PortfolioService
     @Autowired lateinit var formBids: BondApplicationBidService
     @Autowired lateinit var applicationForms: BondApplicationForms
+    @Autowired lateinit var formCleanup: BondApplicationFormCleanup
+    @Autowired lateinit var transactionManager: org.springframework.transaction.PlatformTransactionManager
     @Autowired lateinit var auth: AuthService
     @Autowired lateinit var lifecycle: LifecycleNotifications
     @Autowired lateinit var notifications: PriceNotifications
@@ -46,6 +48,7 @@ class GaboPortfolioApiApplicationTests {
         }
     }
     @BeforeEach fun clean() {
+        marketTestPages.fail = false
         // The test configuration supplies an isolated container or explicitly fenced disposable local PostgreSQL datasource.
         db.execute("TRUNCATE bond_live_activities,bond_month_reminders,investment_cash_ledger,bond_application_forms,guest_migration_items,bond_security_coupon_terms,bond_statement_decisions,bond_statement_sources,account_devices,coupon_receipts,notification_preferences,price_push_deliveries,push_devices,notifications,bond_issuance_documents,bond_purchases,equity_purchases,bond_users,bond_sessions,bond_registration,bond_auth_attempts,bond_uploaded_documents,bond_document_uploads,bond_statement_items,equity_market_observations,equity_market_collection,bond_market_observations,bond_data_migrations")
         db.update("DELETE FROM bond_instruments WHERE id LIKE 'issuance-%'")
@@ -1211,6 +1214,167 @@ class GaboPortfolioApiApplicationTests {
         db.update("UPDATE bond_purchases SET face_value=900000,amount_invested=900000 WHERE id=?::uuid",saved["id"])
         val retried=formBids.create(owner,form,mapOf("amount" to 1000000,"bidId" to retry),java.time.LocalDate.parse("2026-11-20"))
         assertEquals(saved["id"],retried["id"]);assertEquals(900000.0,retried.number("faceValue"));assertEquals(1000000.0,retried.number("bidAmount"))
+    }
+
+
+    private val retentionNow = Instant.parse("2026-12-11T12:00:00Z")
+    private fun retentionResults(form: String, published: Instant, changes: Record = emptyMap()): String {
+        val metadata = json.read(db.queryForObject("SELECT metadata::text FROM bond_application_forms WHERE id=?::uuid",String::class.java,form)!!)
+        val terms = metadata["applicationForm"].record().filterKeys { it in setOf("settlementDate","maturityDate","tenorYears","issuanceDate") } +
+            mapOf("bondName" to "FXD 6/2026/5YRS","isin" to "RW-SYNTHETIC-RETENTION","couponRate" to .12,"pricePercent" to 100,
+                "firstCouponDate" to "2027-05-07","couponDates" to listOf("2027-05-07","2031-11-07"),"couponFrequency" to 2,"scheduleConfidence" to "estimated") + changes
+        val id = newId()
+        db.update("INSERT INTO bond_issuance_documents(id,issue_key,sha256,content,metadata,created_at) VALUES(?::uuid,?,?,?,?::jsonb,?::timestamptz)",
+            id,id,id,Base64.getEncoder().encodeToString("%PDF-1.7 synthetic public results\n%%EOF".toByteArray()),
+            json.write(mapOf("category" to "Bond issuance","visibility" to "shared","issuance" to terms)),published.toString())
+        return id
+    }
+    private fun retentionPending(owner: String="owner",settlement: String="2026-11-13"): Record = bidPortfolio.saveBond(owner,
+        bond()+mapOf("settlementDate" to settlement,"maturityDate" to "2031-11-07","tenorYears" to 5))
+
+    @Test fun `retention migration backfills existing bid identities without cascading purchases`() {
+        val schema="retention_upgrade_"+newId().replace("-","")
+        db.dataSource!!.connection.use { connection ->
+            val previous=connection.schema
+            val isolated=JdbcTemplate(org.springframework.jdbc.datasource.SingleConnectionDataSource(connection,true))
+            try {
+                isolated.execute("CREATE SCHEMA $schema")
+                connection.schema=schema
+                isolated.execute("CREATE TABLE bond_application_forms(id uuid PRIMARY KEY)")
+                isolated.execute("CREATE TABLE bond_purchases(id uuid PRIMARY KEY,application_form_id uuid REFERENCES bond_application_forms(id),amount numeric)")
+                val form=newId();val purchase=newId()
+                isolated.update("INSERT INTO bond_application_forms VALUES(?::uuid)",form)
+                isolated.update("INSERT INTO bond_purchases VALUES(?::uuid,?::uuid,123456.78)",purchase,form)
+                org.springframework.jdbc.datasource.init.ResourceDatabasePopulator(
+                    org.springframework.core.io.ClassPathResource("db/migration/V19__application_form_retention.sql")
+                ).execute(isolated.dataSource!!)
+                isolated.update("DELETE FROM bond_application_forms WHERE id=?::uuid",form)
+                val saved=isolated.queryForList("SELECT * FROM bond_purchases").single()
+                assertEquals(purchase,saved["id"].toString())
+                assertEquals(form,saved["application_form_origin_id"].toString())
+                org.junit.jupiter.api.Assertions.assertNull(saved["application_form_id"])
+                assertEquals(java.math.BigDecimal("123456.78"),saved["amount"])
+            } finally {
+                connection.schema=previous
+                isolated.execute("DROP SCHEMA IF EXISTS $schema CASCADE")
+            }
+        }
+    }
+
+    @Test fun `blank form cleanup waits for matching published results and thirty full days`() {
+        val form=verifiedBidForm()
+        db.update("UPDATE bond_application_forms SET created_at='2000-01-01' WHERE id=?::uuid",form)
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("settlementDate" to "2026-10-23"))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("maturityDate" to "2030-11-07"))
+        retentionResults(form,retentionNow.minusSeconds(40*86400),mapOf("tenorYears" to 10))
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        val publication=retentionNow.minusSeconds(30*86400-1)
+        retentionResults(form,publication,mapOf("tenorYears" to 5.0))
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        assertEquals(1,formCleanup.deleteExpired(retentionNow.plusSeconds(1)))
+        org.junit.jupiter.api.Assertions.assertNull(applicationForms.download(form))
+        assertTrue(applicationForms.documents().isEmpty())
+        assertEquals(0,formCleanup.deleteExpired(retentionNow.plusSeconds(86400)))
+        assertEquals(4,db.queryForObject("SELECT count(*) FROM bond_issuance_documents",Int::class.java))
+    }
+
+    @Test fun `blank form cleanup never removes a form while its subscription day is still open`() {
+        val form=verifiedBidForm()
+        retentionResults(form,Instant.parse("2026-10-01T00:00:00Z"))
+        assertEquals(0,formCleanup.deleteExpired(Instant.parse("2026-11-11T21:59:59Z")))
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        assertEquals(1,formCleanup.deleteExpired(Instant.parse("2026-11-11T22:00:00Z")))
+    }
+
+    @Test fun `blank form cleanup retains linked and unlinked unresolved applications across accounts`() {
+        val form=verifiedBidForm();retentionResults(form,retentionNow.minusSeconds(31*86400))
+        val (first,_)=user();val (second,_)=user()
+        val linked=formBids.create(first,form,mapOf("amount" to 1000000,"bidId" to newId()),java.time.LocalDate.parse("2026-11-01"))
+        val unlinked=retentionPending(second)
+        val unrelated=retentionPending(second,"2026-12-13")
+        assertEquals(0,formCleanup.deleteExpired(retentionNow))
+        db.update("UPDATE bond_purchases SET status='active' WHERE id=?::uuid",linked["id"])
+        assertEquals(0,formCleanup.deleteExpired(retentionNow.plusSeconds(86400)))
+        db.update("UPDATE bond_purchases SET status='active' WHERE id=?::uuid",unlinked["id"])
+        assertEquals(1,formCleanup.deleteExpired(retentionNow.plusSeconds(2*86400)))
+        assertEquals(3,db.queryForObject("SELECT count(*) FROM bond_purchases",Int::class.java))
+        assertEquals("submitted",db.queryForObject("SELECT status FROM bond_purchases WHERE id=?::uuid",String::class.java,unrelated["id"]))
+    }
+
+    @Test fun `blank form cleanup preserves all resolved purchase data confirmations and bid retries`() {
+        val form=verifiedBidForm();val report=retentionResults(form,retentionNow.minusSeconds(30*86400))
+        val cookie=login();val confirmation=data(upload(cookie)).text("documentId")
+        notifications.event("owner","subscriptions","synthetic-retired-form",java.time.LocalDate.parse("2026-11-11"),
+            mapOf("calendarId" to "2026-11-5y-new","documentId" to form,"action" to "calendar"))
+        val bids=listOf("active","sold","matured").mapIndexed { index,status ->
+            val amount=(index+1)*1000000
+            val bid=newId()
+            val purchase=formBids.create("owner",form,mapOf("amount" to amount,"bidId" to bid),java.time.LocalDate.parse("2026-11-01"))
+            db.update("UPDATE bond_purchases SET status=?,confirmation_document_id=?::uuid,confirmation_method='document' WHERE id=?::uuid",status,confirmation,purchase["id"])
+            Triple(purchase.text("id"),bid,amount)
+        }
+        fun snapshots()=db.queryForList("SELECT (to_jsonb(p)-'application_form_id')::text AS data FROM bond_purchases p ORDER BY id")
+        val purchasesBefore=snapshots()
+        val filesBefore=db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_uploaded_documents d ORDER BY id")
+        val resultsBefore=db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_issuance_documents d ORDER BY id")
+        assertEquals(1,formCleanup.deleteExpired(retentionNow))
+        val alert=json.read(db.queryForObject("SELECT payload::text FROM notifications WHERE event_key='synthetic-retired-form'",String::class.java)!!)
+        assertFalse(alert.containsKey("documentId"));assertEquals("2026-11-5y-new",alert["calendarId"])
+        assertEquals(purchasesBefore,snapshots());assertEquals(filesBefore,db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_uploaded_documents d ORDER BY id"))
+        assertEquals(resultsBefore,db.queryForList("SELECT to_jsonb(d)::text AS data FROM bond_issuance_documents d ORDER BY id"))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM bond_purchases WHERE application_form_id IS NOT NULL",Int::class.java))
+        assertEquals(404,call("/documents/$form",cookie=cookie).statusCode())
+        assertEquals(200,call("/documents/$confirmation",cookie=cookie).statusCode())
+        assertEquals(200,call("/documents/$report",cookie=cookie).statusCode())
+        for((id,bid,amount) in bids) {
+            val retried=formBids.create("owner",form,mapOf("amount" to amount,"bidId" to bid),java.time.LocalDate.parse("2026-12-11"))
+            assertEquals(id,retried.text("id"));assertTrue(retried.text("applicationFormDocumentId").isBlank())
+            assertEquals(form,db.queryForObject("SELECT application_form_origin_id::text FROM bond_purchases WHERE id=?::uuid",String::class.java,id))
+            assertThrows(ApiError::class.java) { formBids.create("owner",newId(),mapOf("amount" to amount,"bidId" to bid)) }
+            assertThrows(ApiError::class.java) { formBids.create("owner",form,mapOf("amount" to amount+100000,"bidId" to bid)) }
+        }
+    }
+
+    @Test fun `blank form cleanup waits for concurrent pending writes before checking eligibility`() {
+        val form=verifiedBidForm();retentionResults(form,retentionNow.minusSeconds(31*86400))
+        val inserted=java.util.concurrent.CountDownLatch(1)
+        val release=java.util.concurrent.CountDownLatch(1)
+        val started=java.util.concurrent.CountDownLatch(1)
+        val executor=java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val writer=executor.submit {
+                org.springframework.transaction.support.TransactionTemplate(transactionManager).execute {
+                    retentionPending()
+                    inserted.countDown()
+                    check(release.await(5,java.util.concurrent.TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(inserted.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            val cleanup=executor.submit<Int> { started.countDown();formCleanup.deleteExpired(retentionNow) }
+            assertTrue(started.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { cleanup.get(200,java.util.concurrent.TimeUnit.MILLISECONDS) }
+            release.countDown();writer.get(5,java.util.concurrent.TimeUnit.SECONDS)
+            assertEquals(0,cleanup.get(5,java.util.concurrent.TimeUnit.SECONDS))
+            org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        } finally { release.countDown();executor.shutdownNow() }
+    }
+
+    @Test fun `authenticated daily job cleans blank forms even when market collection fails`() {
+        val form=verifiedBidForm();retentionResults(form,Instant.now().minusSeconds(31*86400))
+        assertEquals(401,call("/rse/daily").statusCode())
+        org.junit.jupiter.api.Assertions.assertNotNull(applicationForms.download(form))
+        marketTestPages.fail=true
+        try {
+            val request=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds/rse/daily"))
+                .header("Authorization","Bearer synthetic-cron-secret").GET().build()
+            val response=http.send(request,HttpResponse.BodyHandlers.ofString())
+            assertEquals(503,response.statusCode())
+            val cleanup=data(response)["applicationFormCleanup"].record()
+            assertEquals("completed",cleanup["status"]);assertEquals(1.0,cleanup.number("deleted"))
+            org.junit.jupiter.api.Assertions.assertNull(applicationForms.download(form))
+        } finally { marketTestPages.fail=false }
     }
 
 }

@@ -29,7 +29,7 @@ class BondApplicationBidService(private val db: JdbcTemplate, private val forms:
         val amount=p.decimal("amount")
         checkApi(amount>=BigDecimal("100000") && amount<=BigDecimal("10000000000000") && amount.remainder(BigDecimal("100000")).signum()==0,"Use an amount in RWF 100,000 increments.")
         lockAccount(db,owner)
-        val prior=db.queryForList("SELECT id::text,application_form_id::text,bid_amount FROM bond_purchases WHERE owner_id=? AND client_bid_id=?::uuid",owner,p["bidId"]).singleOrNull()
+        val prior=db.queryForList("SELECT id::text,COALESCE(application_form_origin_id,application_form_id)::text AS application_form_id,bid_amount FROM bond_purchases WHERE owner_id=? AND client_bid_id=?::uuid",owner,p["bidId"]).singleOrNull()
         if(prior!=null) {
             checkApi(prior.text("application_form_id")==formId && prior.decimal("bid_amount").compareTo(amount)==0,"This bid identity is already in use.",409)
             return portfolio.bond(owner,prior.text("id")) ?: throw ApiError(409,"The saved bid is unavailable. Refresh your portfolio.")
@@ -45,7 +45,7 @@ class BondApplicationBidService(private val db: JdbcTemplate, private val forms:
             "tenorYears" to terms["tenorYears"],"faceValue" to amount,"pricePercent" to 100,"couponRate" to 0,"couponFrequency" to 2,"withholdingTaxRate" to BigDecimal("0.05"),
             "firstCouponDate" to "","couponDates" to emptyList<String>(),"scheduleConfidence" to "estimated","accruedInterestPaid" to 0,"feesPaid" to 0,"status" to "submitted",
             "notes" to "Pending bid. Allocation, executed price, fees and coupon are unconfirmed."))
-        db.update("UPDATE bond_purchases SET application_form_id=?::uuid,client_bid_id=?::uuid,bid_amount=? WHERE id=?::uuid AND owner_id=?",formId,p["bidId"],amount,purchase["id"],owner)
+        db.update("UPDATE bond_purchases SET application_form_id=?::uuid,application_form_origin_id=?::uuid,client_bid_id=?::uuid,bid_amount=? WHERE id=?::uuid AND owner_id=?",formId,formId,p["bidId"],amount,purchase["id"],owner)
         return portfolio.bond(owner,purchase.text("id"))!!
     }
 }

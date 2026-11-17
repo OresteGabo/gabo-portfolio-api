@@ -36,9 +36,11 @@ class TestcontainersConfiguration {
 
 /** Synthetic upstream: integration tests never fetch a live market website. */
 class CountingMarketTestPages : MarketPages {
+    @Volatile var fail = false
     val reads = java.util.concurrent.atomic.AtomicInteger()
     override fun get(path: String): String {
         reads.incrementAndGet()
+        if (fail) error("Synthetic upstream failure")
         return "<html><table><tbody><tr><td>Synthetic IMR</td><td>90</td><td>89</td><td>1</td><td>1</td><td>90</td></tr></tbody></table></html>"
     }
 }

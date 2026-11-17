@@ -8,7 +8,7 @@ import java.time.Instant
 
 @RestController
 @RequestMapping("/api/bonds/rse")
-class MarketController(private val market: MarketService,private val history: MarketHistory,private val notifications: PriceNotifications,private val pushes: PricePushSender,private val lifecycle: LifecycleNotifications,
+class MarketController(private val market: MarketService,private val history: MarketHistory,private val notifications: PriceNotifications,private val pushes: PricePushSender,private val lifecycle: LifecycleNotifications,private val formCleanup: BondApplicationFormCleanup,
     @Value("\${gabo.cron-secret:}") private val cronSecret: String,
     @Value("\${gabo.snapshot-secret:}") private val snapshotSecret: String) {
     @GetMapping("/quotes") fun quotes(@RequestParam kind: String,@RequestParam(required=false) refresh: String?): Record {
@@ -28,6 +28,9 @@ class MarketController(private val market: MarketService,private val history: Ma
     @GetMapping("/daily") fun daily(@RequestHeader("Authorization",required=false) authorization: String?): ResponseEntity<Record> {
         authorize(authorization,cronSecret)
         val start=Instant.now()
+        // Independent of market availability; run before optional network collection.
+        val cleanup=runCatching { formCleanup.deleteExpired(start) }
+        if(cleanup.isFailure) org.slf4j.LoggerFactory.getLogger(javaClass).warn("Blank application form cleanup failed; it will retry on the next daily run.",cleanup.exceptionOrNull())
         val result=runCatching {
             var data=market.quotes("equities",true)
             if(data["source"].record().text("status")!="available" || data["source"].record().text("publishedAt").isBlank()) data=market.quotes("equities",true)
@@ -41,7 +44,8 @@ class MarketController(private val market: MarketService,private val history: Ma
         runCatching { lifecycle.daily() }
         runCatching { pushes.deliver() }
         runCatching { history.run(start,result.text("status"),result.text("marketDate").ifBlank { null }) }
-        return ResponseEntity.status(if(result["status"]=="saved")200 else 503).body(result)
+        return ResponseEntity.status(if(result["status"]=="saved" && cleanup.isSuccess)200 else 503).body(
+            result+mapOf("applicationFormCleanup" to if(cleanup.isSuccess) mapOf("status" to "completed","deleted" to cleanup.getOrThrow()) else mapOf("status" to "failed")))
     }
     @GetMapping("/snapshot") fun snapshot(@RequestHeader("Authorization",required=false) authorization: String?): Record {
         authorize(authorization,snapshotSecret)
