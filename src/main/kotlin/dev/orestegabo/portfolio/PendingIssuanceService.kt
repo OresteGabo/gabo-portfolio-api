@@ -19,7 +19,7 @@ class PendingIssuanceService(private val db: JdbcTemplate,private val json: Json
     // Application identity and investor cash/quantity are unchanged. These are public terms, not allocation evidence.
     fun refresh(owner: String?=null): Int {
         val issues=issues();if(issues.isEmpty())return 0
-        val rows=if(owner==null)db.queryForList("SELECT * FROM bond_purchases WHERE status='submitted'") else db.queryForList("SELECT * FROM bond_purchases WHERE status='submitted' AND owner_id=?",owner)
+        val rows=if(owner==null)db.queryForList("SELECT * FROM bond_purchases WHERE status='submitted' AND linked_purchase_id IS NULL") else db.queryForList("SELECT * FROM bond_purchases WHERE status='submitted' AND linked_purchase_id IS NULL AND owner_id=?",owner)
         var changed=0
         for(row in rows) {
             val input=mapOf("status" to row["status"],"issuer" to row["issuer"],"currency" to row["currency"].toString().trim(),"market" to row["market"],
@@ -33,7 +33,7 @@ class PendingIssuanceService(private val db: JdbcTemplate,private val json: Json
                 (row["coupon_frequency"] as Number).toInt()==terms.number("couponFrequency").toInt() && row["schedule_confidence"]==terms["scheduleConfidence"])continue
             val updated=db.update("""UPDATE bond_purchases SET coupon_rate=?,first_coupon_date=?::date,coupon_dates=?::jsonb,
                 coupon_frequency=?,schedule_confidence=?,maturity_date=?::date,issuance_document_id=?::uuid,updated_at=now()
-                WHERE id=?::uuid AND status='submitted'""",terms["couponRate"],terms["firstCouponDate"],json.write(terms["couponDates"]),
+                WHERE id=?::uuid AND status='submitted' AND linked_purchase_id IS NULL""",terms["couponRate"],terms["firstCouponDate"],json.write(terms["couponDates"]),
                 terms["couponFrequency"],terms["scheduleConfidence"],terms["maturityDate"],match["id"],row["id"].toString())
             changed+=updated
             if(updated>0) notifications.event(row.text("owner_id"),"pending","issuance:${match.text("id")}:${row["id"]}",notificationToday(),

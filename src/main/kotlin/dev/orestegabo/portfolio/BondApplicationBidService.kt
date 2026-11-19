@@ -32,7 +32,7 @@ class BondApplicationBidService(private val db: JdbcTemplate, private val forms:
         val prior=db.queryForList("SELECT id::text,COALESCE(application_form_origin_id,application_form_id)::text AS application_form_id,bid_amount FROM bond_purchases WHERE owner_id=? AND client_bid_id=?::uuid",owner,p["bidId"]).singleOrNull()
         if(prior!=null) {
             checkApi(prior.text("application_form_id")==formId && prior.decimal("bid_amount").compareTo(amount)==0,"This bid identity is already in use.",409)
-            return portfolio.bond(owner,prior.text("id")) ?: throw ApiError(409,"The saved bid is unavailable. Refresh your portfolio.")
+            return portfolio.bondOrLinked(owner,prior.text("id")) ?: throw ApiError(409,"The saved bid is unavailable. Refresh your portfolio.")
         }
         val form=forms.bidForm(formId) ?: throw ApiError(404,"Application form not found.")
         val issue=forms.calendarIssue(form["applicationForm"].record().text("calendarId"))

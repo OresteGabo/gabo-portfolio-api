@@ -31,7 +31,7 @@ class BondApplicationFormCleanup(private val db: JdbcTemplate) {
               )
               AND NOT EXISTS (
                 SELECT 1 FROM bond_purchases p
-                WHERE p.status = 'submitted'
+                WHERE p.status = 'submitted' AND p.linked_purchase_id IS NULL
                   AND (p.application_form_id = f.id OR (
                     p.issuer = 'Government of Rwanda' AND p.currency = 'RWF' AND p.market = 'primary'
                     AND p.settlement_date::text = f.metadata #>> '{applicationForm,settlementDate}'

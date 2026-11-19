@@ -16,7 +16,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
     fun bonds(owner: String): List<Record> {
         pending.refresh(owner)
         val publicEvidence = db.queryForList("SELECT id::text,metadata FROM bond_issuance_documents").map { it.text("id") to json.read(it["metadata"].toString())["issuance"].record() }
-        return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata,COALESCE(c.legacy_id,c.id::text,p.confirmation_document_id::text) AS confirmation_reference FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id LEFT JOIN bond_uploaded_documents c ON c.id=p.confirmation_document_id AND c.owner_id=p.owner_id WHERE p.owner_id=? ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
+        return db.queryForList("SELECT p.*,i.metadata AS issuance_metadata,COALESCE(c.legacy_id,c.id::text,p.confirmation_document_id::text) AS confirmation_reference FROM bond_purchases p LEFT JOIN bond_issuance_documents i ON i.id=p.issuance_document_id LEFT JOIN bond_uploaded_documents c ON c.id=p.confirmation_document_id AND c.owner_id=p.owner_id WHERE p.owner_id=? AND p.linked_purchase_id IS NULL ORDER BY p.purchase_date DESC,p.created_at DESC,p.id",owner).map { row ->
             val result = linkedMapOf<String,Any?>("id" to row["id"].toString(),"createdAt" to (row["created_at"] as java.sql.Timestamp).toInstant().toString(),"instrumentId" to row["instrument_id"],"applicationFormDocumentId" to row["application_form_id"]?.toString(),"bidId" to row["client_bid_id"]?.toString(),"bidAmount" to row["bid_amount"],"statementDocumentId" to row["statement_document_id"]?.toString())
             for(key in bondFields) result[key] = when(key) {
                 "couponDates" -> json.mapper.readValue(row[column(key)].toString(),List::class.java)
@@ -33,6 +33,13 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         }
     }
     fun bond(owner: String,id: String) = bonds(owner).firstOrNull { it.text("id")==id }
+    fun bondOrLinked(owner: String,id: String): Record? {
+        val purchases=bonds(owner)
+        purchases.firstOrNull { it.text("id")==id }?.let { return it }
+        if(!uuid(id))return null
+        val linked=db.query("SELECT linked_purchase_id::text FROM bond_purchases WHERE owner_id=? AND id=?::uuid AND linked_purchase_id IS NOT NULL",{r,_->r.getString(1)},owner,id).singleOrNull()
+        return purchases.firstOrNull { it.text("id")==linked }
+    }
     fun shares(owner: String): List<Record> = db.query("""SELECT holding || jsonb_build_object(
         'remainingShares',(holding->>'shares')::numeric-COALESCE(s.sold,0),
         'soldShares',COALESCE(s.sold,0),
@@ -60,7 +67,9 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
                 return bond(owner,prior.text("id"))!!
             }
         }
-        val existing = id?.let { checkApi(uuid(it),"Invalid purchase id."); bond(owner,it) ?: throw ApiError(404,"Purchase not found.") }
+        val existing = id?.let { checkApi(uuid(it),"Invalid purchase id.")
+            checkApi(db.queryForObject("SELECT count(*) FROM bond_purchases WHERE owner_id=? AND id=?::uuid AND linked_purchase_id IS NOT NULL",Long::class.java,owner,it)==0L,"This pending purchase is already linked. Refresh your portfolio.",409)
+            bond(owner,it) ?: throw ApiError(404,"Purchase not found.") }
         val p = purchase + mapOf("id" to (id ?: newId()),"createdAt" to (existing?.get("createdAt") ?: Instant.now().toString()))
         val placeholders = bondFields.map { when(it) { "couponDates" -> "?::jsonb"; in dates -> "?::date"; else -> "?" } }
         val values = bondFields.map { key -> when(key) { "couponDates" -> json.write(p[key]); in dates -> p.text(key).ifEmpty { null }; else -> p[key] } }

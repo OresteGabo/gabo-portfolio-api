@@ -15,7 +15,7 @@ class PortfolioController(private val portfolio: PortfolioService,private val do
     @GetMapping("/purchases") fun bonds()=mapOf("purchases" to portfolio.bonds(currentAccount().id))
     @GetMapping("/purchases/{id}") fun bond(@PathVariable id: String): Record {
         checkApi(uuid(id),"Invalid purchase id.")
-        return mapOf("purchase" to (portfolio.bond(currentAccount().id,id) ?: throw ApiError(404,"Purchase not found.")))
+        return mapOf("purchase" to (portfolio.bondOrLinked(currentAccount().id,id) ?: throw ApiError(404,"Purchase not found.")))
     }
     @PostMapping("/purchases") @ResponseStatus(HttpStatus.CREATED)
     fun createBond(@RequestBody body: Record)=mapOf("purchase" to portfolio.saveBond(currentAccount().id,body))
