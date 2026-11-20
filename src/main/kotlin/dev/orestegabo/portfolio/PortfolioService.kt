@@ -126,15 +126,7 @@ class PortfolioService(private val db: JdbcTemplate, private val json: JsonCodec
         db.update("INSERT INTO equity_purchases(id,owner_id,dedup_key,contract_key,report_key,holding) VALUES (?::uuid,?,?,?,?,?::jsonb)",p["id"],owner,validation.equityKey(p),contract,p.text("tradeReportId").ifBlank { null },json.write(p))
         return p
     }
-    fun accounts(owner: Account,friend: Account?): List<Record> {
-        val accounts = mutableListOf<Record>(mapOf("id" to owner.id,"email" to owner.email,"createdAt" to null,"status" to "active","kind" to "owner","deletable" to false))
-        friend?.let { accounts+=mapOf("id" to it.id,"email" to it.email,"createdAt" to null,"status" to "active","kind" to "environment","deletable" to false) }
-        accounts += db.queryForList("SELECT id,email,created_at::text AS \"createdAt\",CASE WHEN disabled_at IS NULL THEN 'active' ELSE 'disabled' END AS status FROM bond_users ORDER BY created_at DESC,email").map { it+mapOf("kind" to "database","deletable" to (it["email"]!=owner.email && it["id"]!=friend?.id)) }
-        return accounts.map { a ->
-            val b=bonds(a.text("id")); val s=shares(a.text("id"))
-            a+mapOf("portfolio" to mapOf("purchaseCount" to b.size,"principalByCurrency" to b.groupBy { it.text("currency") }.map { (c,rows)->mapOf("currency" to c,"amount" to rows.sumOf { it.decimal("faceValue") }) },"latestPurchase" to b.firstOrNull()?.filterKeys { it in listOf("bondName","isin","purchaseDate","createdAt") },"equityActivity" to mapOf("purchaseCount" to s.size,"cashCost" to s.sumOf { it.decimal("netAmountPayable") },"latestSecurity" to s.maxByOrNull { it.text("createdAt") }?.let { "${it.text("securityName")} (${it.text("ticker")})" })))
-        }
-    }
+
 }
 
 object MobileOverview {

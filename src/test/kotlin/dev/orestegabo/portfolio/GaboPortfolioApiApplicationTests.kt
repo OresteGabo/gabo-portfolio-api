@@ -118,6 +118,25 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(200,upload(cookie).statusCode())
         assertEquals(1,data(call("/documents",cookie=cookie)).records("documents").size)
     }
+    @Test fun `only the owner receives isolated account portfolio value summaries`() {
+        val owner=login(); val (_,other)=user()
+        assertEquals(201,call("/purchases","POST",bond(),owner).statusCode())
+        assertEquals(201,call("/equities","POST",equity(),owner).statusCode())
+        assertEquals(201,call("/purchases","POST",bond()+mapOf("faceValue" to 500000),other).statusCode())
+        assertEquals(401,call("/auth/accounts").statusCode())
+        assertEquals(403,call("/auth/accounts",cookie=other).statusCode())
+        val response=call("/auth/accounts",cookie=owner)
+        assertEquals(200,response.statusCode(),response.body())
+        val accounts=data(response).records("accounts")
+        val mine=accounts.single { it.text("kind")=="owner" }["portfolio"].record()
+        val valuation=mine["valuation"].record().records("currencies").single()
+        assertEquals(1200000.0,valuation.number("bondValue"))
+        assertEquals(91100.0,valuation.number("shareValue"))
+        assertEquals(1291100.0,valuation.number("estimatedNetWorth"))
+        assertFalse(mine.containsKey("holdings")); assertFalse(mine.containsKey("purchases"))
+        val theirs=accounts.single { it.text("kind")=="database" }["portfolio"].record()["valuation"].record().records("currencies").single()
+        assertEquals(500000.0,theirs.number("estimatedNetWorth"))
+    }
     @Test fun `accounts cannot access or mutate each others purchases and PDFs`() {
         val (_,a)=user();val (_,b)=user()
         val id=data(call("/purchases","POST",bond(),a))["purchase"].record().text("id")

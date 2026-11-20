@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*
 
 @RestController
 @RequestMapping("/api/bonds/auth")
-class AuthController(private val auth: AuthService, private val portfolios: PortfolioService,private val notifications: PriceNotifications,private val lifecycle: LifecycleNotifications) {
+class AuthController(private val auth: AuthService, private val portfolios: OwnerAccountPortfolios,private val notifications: PriceNotifications,private val lifecycle: LifecycleNotifications) {
     @GetMapping("/session") fun session(): Record {
         val account = currentAccountOrNull()
         return mapOf("authenticated" to (account != null), "user" to account?.publicInfo())
