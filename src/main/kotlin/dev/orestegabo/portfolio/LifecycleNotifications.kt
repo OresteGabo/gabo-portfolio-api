@@ -49,13 +49,15 @@ class LifecycleNotifications(private val db: JdbcTemplate,
                              private val statements: StatementService,
                              private val notifications: PriceNotifications,
                              private val bondReminders: BondReminders,
+                             private val shareOrders: ShareOrders,
                              transactionManager: org.springframework.transaction.PlatformTransactionManager)
 {
     private val dailyTransactions=org.springframework.transaction.support.TransactionTemplate(transactionManager)
     fun preferences(owner: String): Record {
-        val row=db.queryForList("SELECT categories,auto_coupon,monthly_target FROM notification_preferences WHERE owner_id=?",owner).firstOrNull()
+        val row=db.queryForList("SELECT categories,auto_coupon,monthly_target,goal_period,yearly_target FROM notification_preferences WHERE owner_id=?",owner).firstOrNull()
         return mapOf("configured" to (row!=null),"categories" to notificationCategories.associateWith { row?.get("categories")?.toString()?.let(json::read)?.get(it) ?: true },
-            "autoCoupon" to (row?.get("auto_coupon") ?: false),"monthlyTarget" to (row?.get("monthly_target") ?: 100000))
+            "autoCoupon" to (row?.get("auto_coupon") ?: false),"monthlyTarget" to (row?.get("monthly_target") ?: 100000),
+            "yearlyTarget" to (row?.get("yearly_target") ?: 1200000),"goalPeriod" to (row?.get("goal_period") ?: "monthly"))
     }
     @Transactional fun update(owner: String,p: Record): Record {
         lockAccount(db,owner)
@@ -64,11 +66,14 @@ class LifecycleNotifications(private val db: JdbcTemplate,
         checkApi(categories.keys==notificationCategories && categories.values.all { it is Boolean },"Invalid notification categories.")
         val auto=p["autoCoupon"] ?: old["autoCoupon"]
         val target=p["monthlyTarget"] ?: old["monthlyTarget"]
+        val yearly=p["yearlyTarget"] ?: old["yearlyTarget"]
+        val period=p["goalPeriod"] ?: old["goalPeriod"]
+        checkApi(period in listOf("monthly","yearly") && yearly is Number && yearly.toDouble().isFinite() && yearly.toDouble()%1==0.0 && yearly.toDouble() in 1.0..1e12,"Invalid investment goal settings.")
         checkApi(auto is Boolean && target is Number && target.toDouble().isFinite() && target.toDouble()%1==0.0 && target.toDouble() in 1.0..1e12,"Invalid notification settings.")
-        db.update("""INSERT INTO notification_preferences(owner_id,categories,auto_coupon,auto_coupon_from,monthly_target) VALUES(?,?::jsonb,?,CASE WHEN ? THEN CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Kigali' ELSE NULL END,?)
+        db.update("""INSERT INTO notification_preferences(owner_id,categories,auto_coupon,auto_coupon_from,monthly_target,yearly_target,goal_period) VALUES(?,?::jsonb,?,CASE WHEN ? THEN CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Kigali' ELSE NULL END,?,?,?)
             ON CONFLICT(owner_id) DO UPDATE SET categories=EXCLUDED.categories,auto_coupon=EXCLUDED.auto_coupon,
                 auto_coupon_from=CASE WHEN EXCLUDED.auto_coupon AND NOT notification_preferences.auto_coupon THEN EXCLUDED.auto_coupon_from ELSE notification_preferences.auto_coupon_from END,
-                monthly_target=EXCLUDED.monthly_target""",owner,json.write(categories),auto,auto,(target as Number).toLong())
+                monthly_target=EXCLUDED.monthly_target,yearly_target=EXCLUDED.yearly_target,goal_period=EXCLUDED.goal_period""",owner,json.write(categories),auto,auto,(target as Number).toLong(),(yearly as Number).toLong(),period)
         return preferences(owner)
     }
     fun schedule(p: Record): List<LocalDate> = bondCouponSchedule(p)
@@ -120,10 +125,11 @@ class LifecycleNotifications(private val db: JdbcTemplate,
         db.update("""UPDATE notifications SET payload=payload||'{"resolved":true}'::jsonb,read_at=COALESCE(read_at,now())
             WHERE owner_id=? AND kind='pending' AND NOT COALESCE((payload->>'resolved')::boolean,false)
             AND payload->>'purchaseId' NOT IN(SELECT jsonb_array_elements_text(?::jsonb))""",owner,json.write(bonds.filter { it.text("status")=="submitted" }.map { it.text("id") }))
-        val month=today.toString().take(7)
-        val invested=bonds.filter { it.text("status")!="submitted" && it.text("currency")=="RWF" && it.text("purchaseDate").startsWith(month) && it.text("purchaseDate")<=today.toString() }.sumOf { it.number("amountInvested") }+
-            shares.filter { it.text("currency")=="RWF" && it.text("tradeDate").startsWith(month) && it.text("tradeDate")<=today.toString() }.sumOf { it.number("netAmountPayable") }
-        if(invested>=preferences.number("monthlyTarget",100000.0))event("targets","target:$month",mapOf("month" to month,"amount" to preferences["monthlyTarget"],"action" to "settings"))
+        val goal = goalContributionProgress(bonds, shares, shareOrders.list(owner), preferences, today)
+        if(goal.decimal("confirmed") + goal.decimal("pending") >= goal.decimal("amount")) {
+            val key = if(goal.text("goalPeriod") == "yearly") "target:year:${today.year}" else "target:${today.toString().take(7)}"
+            event("targets",key,goal + mapOf("month" to (if(goal.text("goalPeriod")=="yearly") today.year.toString() else today.toString().take(7)),"action" to "settings"))
+        }
         notifications.queue()
     }
     fun daily(today: LocalDate=notificationToday()) {

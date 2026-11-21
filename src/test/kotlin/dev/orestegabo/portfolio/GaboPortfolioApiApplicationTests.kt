@@ -371,6 +371,37 @@ class GaboPortfolioApiApplicationTests {
         lifecycle.update("owner",mapOf("categories" to categories))
         assertTrue(notifications.list("owner",null).records("notifications").none { it["kind"]=="coupons" })
     }
+    @Test fun `yearly goals preserve monthly preferences and deduplicate calendar year achievements including pending`() {
+        val today=notificationToday(); val cookie=login()
+        lifecycle.update("owner",mapOf("monthlyTarget" to 10000000,"yearlyTarget" to 1000000,"goalPeriod" to "yearly"))
+        val saved=lifecycle.update("owner",mapOf("monthlyTarget" to 9000000))
+        assertEquals("yearly",saved["goalPeriod"]);assertEquals(1000000.0,saved.number("yearlyTarget"))
+        assertEquals(201,call("/purchases","POST",bond()+mapOf("purchaseDate" to today.withDayOfYear(1).toString()),cookie).statusCode())
+        lifecycle.sync("owner",today); lifecycle.sync("owner",today.plusDays(1))
+        val goal=notifications.list("owner",null).records("notifications").single { it["kind"]=="targets" }
+        assertEquals("yearly",goal["goalPeriod"]);assertTrue(goal.number("pending")>0)
+        assertThrows(ApiError::class.java) { lifecycle.update("owner",mapOf("goalPeriod" to "weekly")) }
+        assertThrows(ApiError::class.java) { lifecycle.update("owner",mapOf("yearlyTarget" to 0)) }
+        assertEquals("yearly",lifecycle.preferences("owner")["goalPeriod"])
+    }
+    @Test fun `V21 preserves old preferences and backfills a bounded annual suggestion`() {
+        org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult { tx ->
+            val schema="goal_upgrade_"+newId().replace("-", "")
+            db.execute("CREATE SCHEMA $schema")
+            db.execute("SET LOCAL search_path TO $schema,public")
+            db.execute("CREATE TABLE $schema.notification_preferences (LIKE public.notification_preferences INCLUDING ALL)")
+            db.execute("ALTER TABLE $schema.notification_preferences DROP COLUMN goal_period CASCADE")
+            db.execute("ALTER TABLE $schema.notification_preferences DROP COLUMN yearly_target CASCADE")
+            db.update("INSERT INTO $schema.notification_preferences(owner_id,monthly_target,auto_coupon,categories) VALUES ('synthetic',300000,true,'{\"targets\":false}'),('max',1000000000000,false,'{}')")
+            val before=db.queryForList("SELECT to_jsonb(p)::text FROM $schema.notification_preferences p ORDER BY owner_id",String::class.java)
+            db.execute(javaClass.getResource("/db/migration/V21__monthly_and_yearly_investment_goals.sql")!!.readText())
+            assertEquals(before,db.queryForList("SELECT (to_jsonb(p)-'goal_period'-'yearly_target')::text FROM $schema.notification_preferences p ORDER BY owner_id",String::class.java))
+            assertEquals(3600000L,db.queryForObject("SELECT yearly_target FROM $schema.notification_preferences WHERE owner_id='synthetic'",Long::class.java))
+            assertEquals(1000000000000L,db.queryForObject("SELECT yearly_target FROM $schema.notification_preferences WHERE owner_id='max'",Long::class.java))
+            assertEquals(2L,db.queryForObject("SELECT count(*) FROM $schema.notification_preferences WHERE goal_period='monthly'",Long::class.java))
+            tx.setRollbackOnly()
+        }
+    }
     @Test fun `general reminders reports targets and new devices are deduplicated`() {
         val cookie=login();val today=notificationToday()
         assertEquals(201,call("/purchases","POST",bond(),cookie).statusCode())
