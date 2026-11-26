@@ -316,6 +316,25 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(1,history.history(listOf("IMR"),"all").records("observations").size)
         assertEquals(401,call("/rse/daily").statusCode());assertEquals(401,call("/rse/snapshot").statusCode())
     }
+    @Test fun `mark all read covers older pages without touching another account or resetting read timestamps`() {
+        val owner=login();val (otherId,otherCookie)=user()
+        db.update("INSERT INTO notifications(owner_id,kind,event_key,market_date,payload) SELECT ?, 'security','bulk-'||n,CURRENT_DATE-n,'{}'::jsonb FROM generate_series(1,250) n","owner")
+        db.update("INSERT INTO notifications(owner_id,kind,event_key,market_date,payload) VALUES(?,'security','other',CURRENT_DATE,'{}'::jsonb)",otherId)
+        db.update("UPDATE notifications SET read_at='2026-01-01T00:00:00Z' WHERE owner_id='owner' AND event_key='bulk-1'")
+        assertEquals(401,call("/notifications/read-all","POST",emptyMap<String,Any>()).statusCode())
+        val response=call("/notifications/read-all","POST",emptyMap<String,Any>(),owner)
+        assertEquals(200,response.statusCode(),response.body())
+        assertEquals(true,data(response)["saved"]);assertEquals(249.0,data(response).number("markedRead"))
+        assertEquals(0.0,data(response).number("unreadCount"))
+        assertEquals(0,db.queryForObject("SELECT count(*) FROM notifications WHERE owner_id='owner' AND read_at IS NULL",Int::class.java))
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM notifications WHERE owner_id=? AND read_at IS NULL",Int::class.java,otherId))
+        assertEquals(java.time.Instant.parse("2026-01-01T00:00:00Z"),db.queryForObject("SELECT read_at FROM notifications WHERE owner_id='owner' AND event_key='bulk-1'",java.sql.Timestamp::class.java)!!.toInstant())
+        assertEquals(0.0,data(call("/notifications/read-all","POST",emptyMap<String,Any>(),owner)).number("markedRead"))
+        assertEquals(1.0,data(call("/notifications/read-all","POST",emptyMap<String,Any>(),otherCookie)).number("markedRead"))
+        db.update("INSERT INTO notifications(owner_id,kind,event_key,market_date,payload) VALUES('owner','security','new-after-bulk',CURRENT_DATE,'{}'::jsonb)")
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM notifications WHERE owner_id='owner' AND read_at IS NULL",Int::class.java))
+    }
+
     @Test fun `scheduled prices record new closes reuse cache and respect disabled price alerts`() {
         val cookie=login();val (muted,mutedCookie)=user()
         for(session in listOf(cookie,mutedCookie)) assertEquals(201,call("/equities","POST",equity(),session).statusCode())

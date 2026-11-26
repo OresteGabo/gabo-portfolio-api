@@ -53,7 +53,7 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
             closing_price*shares-cash_cost AS "totalGain",(closing_price*shares/NULLIF(cash_cost,0)-1)*100 AS "totalGainPercent",
             read_at IS NOT NULL AS read FROM notifications WHERE owner_id=? AND market_date IN(SELECT jsonb_array_elements_text(?::jsonb)::date)
             ORDER BY market_date DESC,ticker""",owner,json.write(days))
-        val unread=db.queryForObject("SELECT count(*) FROM notifications WHERE owner_id=? AND read_at IS NULL AND COALESCE((SELECT (categories->>notifications.kind)::boolean FROM notification_preferences WHERE owner_id=notifications.owner_id),true)",Int::class.java,owner) ?: 0
+        val unread=unreadCount(owner)
         val receipts=db.queryForList("SELECT purchase_id::text AS id,due_date::text AS date,received,method FROM coupon_receipts WHERE owner_id=?",owner)
         val categories=db.queryForList("SELECT categories FROM notification_preferences WHERE owner_id=?",owner).firstOrNull()?.get("categories")?.toString()?.let(json::read).orEmpty()
         val values=rows.filter { categories[it.text("kind")]!=false }.map { row ->
@@ -76,6 +76,15 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
                 AND COALESCE((SELECT (categories->>n.kind)::boolean FROM notification_preferences WHERE owner_id=n.owner_id),true)
             ON CONFLICT DO NOTHING""")
     }
+    private fun unreadCount(owner: String): Int = db.queryForObject("SELECT count(*) FROM notifications WHERE owner_id=? AND read_at IS NULL AND COALESCE((SELECT (categories->>notifications.kind)::boolean FROM notification_preferences WHERE owner_id=notifications.owner_id),true)",Int::class.java,owner) ?: 0
+
+    /** One account-wide acknowledgement, independent of inbox pagination and the per-ID batch limit. */
+    @Transactional
+    fun readAll(owner: String): Record {
+        val changed=db.update("UPDATE notifications SET read_at=now() WHERE owner_id=? AND read_at IS NULL",owner)
+        return mapOf("saved" to true,"markedRead" to changed,"unreadCount" to unreadCount(owner))
+    }
+
     fun read(owner: String,ids: List<String>) {
         checkApi(ids.size in 1..200 && ids.all(::uuid),"Invalid notifications.")
         db.update("UPDATE notifications SET read_at=COALESCE(read_at,now()) WHERE owner_id=? AND id IN(SELECT jsonb_array_elements_text(?::jsonb)::uuid)",owner,json.write(ids))
@@ -105,6 +114,7 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
 @RequestMapping("/api/bonds/notifications")
 class PriceNotificationController(private val notifications: PriceNotifications,private val lifecycle: LifecycleNotifications) {
     @GetMapping fun list(@RequestParam(required=false) before: String?): Record { val owner=currentAccount().id;lifecycle.sync(owner);return notifications.list(owner,before) }
+    @PostMapping("/read-all") fun readAll(): Record = notifications.readAll(currentAccount().id)
     @PostMapping("/read") fun read(@RequestBody p: Record): Record { notifications.read(currentAccount().id,p.strings("ids"));return mapOf("saved" to true) }
     @PostMapping("/devices") fun register(@RequestBody p: Record): Record { notifications.register(currentAccount().id,p);return mapOf("saved" to true) }
     @DeleteMapping("/devices/{id}") fun unregister(@PathVariable id: String): Record { notifications.unregister(currentAccount().id,id);return mapOf("deleted" to true) }
