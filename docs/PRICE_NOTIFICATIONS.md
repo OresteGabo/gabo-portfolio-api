@@ -46,3 +46,24 @@ Push bodies contain no prices, amounts, holdings or account identity. Details ar
 Push is best-effort. Delivery records track attempts, expire stale alerts after three days for delivery purposes, and cap retries. Successful deliveries are not intentionally resent, but a crash after provider acceptance and before acknowledgement can result in a repeat; APNs collapse IDs and Android notification tags use the alert ID. Retries run on subsequent daily collections. Provider delivery has not been tested on a configured device yet.
 
 Validate Android and iPhone notifications on real devices after configuration, including denied permission, account switching, logout, duplicate collection and tapping a push while the app is locked. Membership, provider configuration and deployment are still required before claiming phone push is operational.
+
+## Missed price collection recovery — 26 November 2026
+
+Production request logs showed the 25 November daily collection returning HTTP 503. Quote reads could subsequently save that day's closing observation, but only the daily collector created price alerts. The existing 15-minute bond-reminder dispatcher delivered queued alerts without collecting price changes. Decreases were already supported; this gap could suppress either direction after a failed daily collection.
+
+The existing authenticated dispatcher now also uses the cached equity quote reader, records usable dated closes, and creates missing alerts from saved observations within today and the preceding two calendar days (Africa/Kigali). The 15-minute upstream cache remains in place. No new scheduler, provider, table or mobile API is required. First observations, unchanged prices, opted-out accounts and ineligible holdings retain their existing exclusions. Account/company/date uniqueness prevents repeat alerts and push queue duplication. Already-saved closes can recover even during an upstream outage. Database failures still fail the request after bond reminders and queued push retries have had their normal opportunity to run.
+
+Verification used a new disposable PostgreSQL 18 cluster on loopback port 55469, with synthetic records only:
+
+- The new dispatcher recovery regression failed before the fix (zero alerts instead of the expected rise and fall).
+- The corrected dispatcher recovers 720 → 721 and 721 → 720, queues each once across repeated runs, and remains protected by scheduler authorization.
+- A synthetic dated upstream verifies collecting a new decrease, cache reuse, and price-notification opt-out.
+- `JAVA_HOME=<JDK 21> STRUCT_TEST_LOCAL_POSTGRES=true STRUCT_TEST_DATABASE_URL=jdbc:postgresql://127.0.0.1:55469/struct_test_price_recovery ./gradlew build --console=plain`: passed; 124 tests, zero failures/errors/skips. No separate static-analysis plugin is configured in this backend.
+
+Device push display is not established by these synthetic tests; provider acceptance and phone delivery are separate from creation of the in-app alert.
+
+### Production verification
+
+The tested backend was activated before committing as revision `gabo-portfolio-api-price-recovery-1126-v2`, using image `europe-west1-docker.pkg.dev/gabo-portfolio-api/portfolio/api@sha256:b3608b76502867df34baa88679b4f2cff4b96a24dc4f3d55ee604c94c250128a`. The image packages the final locally verified JAR with the existing runtime settings. Candidate health and public health were `UP`; environment/secret references, resources, runtime identity, concurrency and timeout were preserved. No migration or scheduler configuration change was made.
+
+An authenticated live dispatcher invocation returned `processed: true`, price collection `saved`, and **3** recovered alerts across eligible accounts. A second invocation returned **0** created alerts, confirming live deduplication. Provider/phone display was not manually verified. The unused first candidate revision was removed; previous production revisions were retained. The mobile checkout remained unchanged. Production activation and verification preceded the source commit.

@@ -316,6 +316,67 @@ class GaboPortfolioApiApplicationTests {
         assertEquals(1,history.history(listOf("IMR"),"all").records("observations").size)
         assertEquals(401,call("/rse/daily").statusCode());assertEquals(401,call("/rse/snapshot").statusCode())
     }
+    @Test fun `scheduled prices record new closes reuse cache and respect disabled price alerts`() {
+        val cookie=login();val (muted,mutedCookie)=user()
+        for(session in listOf(cookie,mutedCookie)) assertEquals(201,call("/equities","POST",equity(),session).statusCode())
+        lifecycle.update("owner",mapOf("categories" to notificationCategories.associateWith { it=="prices" }))
+        lifecycle.update(muted,mapOf("categories" to notificationCategories.associateWith { false }))
+        val today=notificationToday();val yesterday=today.minusDays(1)
+        history.record(mapOf("source" to mapOf("status" to "available","stale" to false,
+            "publishedAt" to "${yesterday}T00:00:00Z","checkedAt" to "${yesterday}T01:00:00Z"),
+            "quotes" to listOf(mapOf("ticker" to "IMR","closing" to 90))))
+        var reads=0
+        val pages=object : MarketPages {
+            override fun get(path: String): String {
+                assertEquals("/equities-market",path);reads++
+                return "<html>Last updated - ${today.dayOfMonth} ${today.month.name.lowercase()} ${today.year} 00:00 GMT+2<table><tbody><tr><td>Synthetic IMR</td><td>89</td><td>90</td><td>1</td><td>1</td><td>89</td></tr></tbody></table></html>"
+            }
+        }
+        val scheduled=ScheduledPriceNotifications(MarketService(pages,history),history,notifications)
+        assertEquals(1,scheduled.sync()["created"])
+        assertEquals(0,scheduled.sync()["created"])
+        assertEquals(1,reads)
+        val alert=notifications.list("owner",null).records("notifications").single()
+        assertEquals(today.toString(),alert["date"])
+        assertEquals(90.0,alert.number("previousPrice"));assertEquals(89.0,alert.number("closingPrice"))
+        assertTrue(notifications.list(muted,null).records("notifications").isEmpty())
+    }
+
+    @Test fun `scheduled dispatch recovers missed rises and falls even when the upstream is unavailable`() {
+        val cookie=login()
+        lifecycle.update("owner",mapOf("categories" to notificationCategories.associateWith { it=="prices" }))
+        assertEquals(201,call("/equities","POST",equity(),cookie).statusCode())
+        val today=notificationToday()
+        fun close(daysAgo: Long,price: Int) {
+            val day=today.minusDays(daysAgo)
+            history.record(mapOf("source" to mapOf("status" to "available","stale" to false,
+                "publishedAt" to "${day}T00:00:00Z","checkedAt" to "${day}T01:00:00Z"),
+                "quotes" to listOf(mapOf("ticker" to "IMR","closing" to price))))
+        }
+        close(3,720);close(2,720);close(1,721);close(0,720)
+        val device=newId()
+        notifications.register("owner",mapOf("deviceId" to device,"platform" to "android","token" to "synthetic-price-token-$device"))
+        assertEquals(401,call("/notifications/bond-reminders/dispatch").statusCode())
+        assertTrue(notifications.list("owner",null).records("notifications").isEmpty())
+        marketTestPages.fail=true
+        try {
+            repeat(2) {
+                val request=HttpRequest.newBuilder(URI("http://localhost:$port/api/bonds/notifications/bond-reminders/dispatch"))
+                    .header("Authorization","Bearer synthetic-cron-secret").GET().build()
+                val response=http.send(request,HttpResponse.BodyHandlers.ofString())
+                assertEquals(200,response.statusCode(),response.body())
+            }
+            val alerts=notifications.list("owner",null).records("notifications")
+            assertEquals(2,alerts.size)
+            assertEquals(2,db.queryForObject("SELECT count(*) FROM price_push_deliveries WHERE device_id=?::uuid",Int::class.java,device))
+            val rise=alerts.single { it.text("date")==today.minusDays(1).toString() }
+            val fall=alerts.single { it.text("date")==today.toString() }
+            assertEquals(720.0,rise.number("previousPrice"));assertEquals(721.0,rise.number("closingPrice"))
+            assertEquals(721.0,fall.number("previousPrice"));assertEquals(720.0,fall.number("closingPrice"))
+            assertTrue(rise.number("impact")>0);assertTrue(fall.number("impact")<0)
+        } finally { marketTestPages.fail=false }
+    }
+
     @Test fun `price changes alert only eligible holders once and unread data is isolated`() {
         val owner=login();val (uid,other)=user()
         for(account in listOf("owner",uid)) lifecycle.update(account,mapOf("categories" to notificationCategories.associateWith { it=="prices" }))

@@ -8,7 +8,7 @@ import java.time.LocalDate
 
 @Service
 class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCodec) {
-    // Run after the daily closing snapshot, never on every screen refresh.
+    // Run after saved closing snapshots, from the daily collector or scheduled recovery; never from screen refreshes.
     @Transactional
     fun collect(day: String): Int {
         val date=LocalDate.parse(day)
@@ -34,6 +34,14 @@ class PriceNotifications(private val db: JdbcTemplate, private val json: JsonCod
         queue()
         return count
     }
+    /** Recover recent saved closes after missed jobs; collect retains holder/date/preference and deduplication rules. */
+    @Transactional
+    fun collectRecent(today: LocalDate = notificationToday()): Int {
+        val days=db.queryForList("SELECT DISTINCT observed_date::text AS day FROM equity_market_observations WHERE observed_date BETWEEN ?::date AND ?::date ORDER BY day",
+            today.minusDays(2).toString(),today.toString())
+        return days.sumOf { collect(it.text("day")) }
+    }
+
     fun list(owner: String,before: String?): Record {
         val cursor=before?.let { runCatching { LocalDate.parse(it) }.getOrNull() ?: throw ApiError(400,"Invalid notification date.") }
         // Page by entire market day to avoid skipping equal-date notifications.

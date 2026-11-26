@@ -86,7 +86,7 @@ class BondReminders(private val db: JdbcTemplate, private val json: JsonCodec, p
 @RestController
 @RequestMapping("/api/bonds/notifications")
 class BondReminderController(private val reminders: BondReminders, private val lifecycle: LifecycleNotifications,
-    private val pushes: PricePushSender, @Value("\${gabo.cron-secret:}") private val cronSecret: String) {
+    private val pushes: PricePushSender, private val priceUpdates: ScheduledPriceNotifications, @Value("\${gabo.cron-secret:}") private val cronSecret: String) {
     @GetMapping("/bond-reminders") fun list() = reminders.list(currentAccount().id)
     @PutMapping("/bond-reminders/{month}") fun update(@PathVariable month: String,@RequestBody p: Record): Record {
         checkApi(p["enabled"] is Boolean,"Choose whether to enable this reminder.")
@@ -95,7 +95,9 @@ class BondReminderController(private val reminders: BondReminders, private val l
     @PostMapping("/bond-live-activities") fun activity(@RequestBody p: Record) = reminders.activity(currentAccount().id,p)
     @GetMapping("/bond-reminders/dispatch") fun dispatch(@RequestHeader("Authorization",required=false) authorization: String?): Record {
         checkApi(cronSecret.isNotBlank() && MessageDigest.isEqual((authorization ?: "").toByteArray(),"Bearer $cronSecret".toByteArray()),"Unauthorized.",401)
+        val prices=runCatching { priceUpdates.sync() }
+        // A price failure must not prevent bond reminders or queued push retries from running.
         lifecycle.daily();pushes.deliver()
-        return mapOf("processed" to true)
+        return mapOf("processed" to true,"prices" to prices.getOrThrow())
     }
 }
